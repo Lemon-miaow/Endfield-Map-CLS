@@ -38,7 +38,6 @@ ENV/
 # Project Specific
 dataset/
 runs/
-source_images/
 debug_*.jpg
 *.pt
 !yolo26n-cls.pt
