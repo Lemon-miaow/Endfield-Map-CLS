@@ -1,3 +1,19 @@
+"""
+predict.py — 单图推理脚本
+
+对输入截图执行与 C++ 推理端等价的预处理流程，调用 YOLO 分类模型
+输出各类别置信度，并按置信度降序打印结果。
+
+预处理流程（与 C++ 两阶段等价）:
+    1. 按分辨率缩放比例将截图缩放至 720p 基准。
+    2. 按固定坐标裁取小地图 ROI（与调用层 MapLocator 逻辑一致）。
+    3. 将 ROI 居中放置于 OUTPUT_SIZE×OUTPUT_SIZE 黑色画布。
+    4. 应用半径为 MASK_DIAMETER/2 的圆形 Mask，消除外框噪声。
+
+用法:
+    python predict.py <image_path> [--model <path>] [--debug]
+"""
+
 import argparse
 import logging
 from pathlib import Path
@@ -6,19 +22,38 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-# Configuration
+# 推理预处理规格（与训练集 / C++ 推理端保持一致）
 CONFIG = {
-    "OUTPUT_SIZE": 128,  # The dimensions (width/height) of the output image after preprocessing
-    "MASK_DIAMETER": 106,  # Diameter of the circular mask applied to the center of the image
-    "GAME_RES_H": 720,  # Height of the game resolution the input screenshot is taken from
-    "TARGET_RES_H": 720,  # Target height resolution to scale the input image to before processing
+    "OUTPUT_SIZE": 128,    # 预处理输出图像的边长（像素）
+    "MASK_DIAMETER": 106,  # 圆形 Mask 的直径
+    "GAME_RES_H": 720,     # 采集截图时的游戏分辨率高度
+    "TARGET_RES_H": 720,   # 推理前期望缩放到的目标分辨率高度
+    # 小地图在 720p 截图中的 ROI 坐标（与 C++ MapLocator 保持一致）
+    "ROI_X": 49,
+    "ROI_Y": 51,
+    "ROI_W": 118,
+    "ROI_H": 120,
 }
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 
+def safe_imread(path, flags=cv2.IMREAD_COLOR) -> np.ndarray:
+    """读取图片，兼容路径中包含非 ASCII 字符（如中文）的情况。"""
+    return cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), flags)
+
+
 class Predictor:
+    """YOLO 分类推理器。
+
+    封装模型加载、预处理和推理全流程，提供与 C++ 两阶段推理等价的
+    完整预处理逻辑（缩放 → 裁取 ROI → 居中 → 圆形 Mask）。
+
+    Args:
+        model_path: .pt 或 .onnx 权重路径；为 None 时自动发现最新训练结果。
+    """
+
     def __init__(self, model_path: str = None):
         self.model_path = self._resolve_model_path(model_path)
         logger.info(f"Loading model: {self.model_path}")
@@ -26,21 +61,30 @@ class Predictor:
         self.scale_ratio = CONFIG["TARGET_RES_H"] / CONFIG["GAME_RES_H"]
 
     def _resolve_model_path(self, model_path: str) -> Path:
-        """Determines the model path, auto-discovering the latest run if necessary."""
+        """解析模型路径，未指定时自动发现最新的训练结果。
+
+        Args:
+            model_path: 用户显式指定的路径，或 None。
+
+        Returns:
+            有效的模型文件 Path 对象。
+
+        Raises:
+            FileNotFoundError: 指定路径不存在，或自动搜索无结果时抛出。
+        """
         if model_path:
             path = Path(model_path)
             if not path.exists():
                 raise FileNotFoundError(f"Specified model not found: {path}")
             return path
 
-        # Auto-discovery logic
         runs_dir = Path("runs/classify")
         if not runs_dir.exists():
             raise FileNotFoundError(
-                "No training runs found in 'runs/classify'. Please train a model first or specify a path."
+                "No training runs found in 'runs/classify'. "
+                "Please train a model first or specify a path with --model."
             )
 
-        # Find all 'best.pt' files and sort by modification time (newest first)
         candidates = list(runs_dir.rglob("weights/best.pt"))
         if not candidates:
             raise FileNotFoundError("No 'best.pt' found in training runs.")
@@ -50,8 +94,21 @@ class Predictor:
         return latest_model
 
     def preprocess(self, img: np.ndarray) -> np.ndarray:
-        """Resizes, crops, and masks the input image."""
-        # 1. Resize
+        """对原始全屏截图执行完整预处理，与 C++ 两阶段流程等价。
+
+        处理顺序：
+            1. 若游戏分辨率非 720p，等比缩放至 720p 基准。
+            2. 按固定坐标裁取小地图 ROI（与 C++ MapLocator 逻辑一致）。
+            3. 将 ROI 居中放置于 128×128 黑色画布。
+            4. 应用圆形 Mask，消除小地图外框噪声。
+
+        Args:
+            img: 原始 BGR 全屏截图。
+
+        Returns:
+            经预处理的 OUTPUT_SIZE×OUTPUT_SIZE BGR 图像。
+        """
+        # 阶段一：缩放至 720p 基准（TARGET_RES_H == GAME_RES_H 时跳过）
         if self.scale_ratio != 1.0:
             h, w = img.shape[:2]
             img = cv2.resize(
@@ -60,35 +117,59 @@ class Predictor:
                 interpolation=cv2.INTER_AREA,
             )
 
-        # 2. Center Crop to Canvas
-        h, w = img.shape[:2]
+        # 阶段二：裁取小地图 ROI，并做边界钳位防止越界
+        img_h, img_w = img.shape[:2]
+        x, y = CONFIG["ROI_X"], CONFIG["ROI_Y"]
+        rw, rh = CONFIG["ROI_W"], CONFIG["ROI_H"]
+        roi_x1 = max(0, min(x, img_w))
+        roi_y1 = max(0, min(y, img_h))
+        roi_x2 = max(0, min(x + rw, img_w))
+        roi_y2 = max(0, min(y + rh, img_h))
+        minimap = img[roi_y1:roi_y2, roi_x1:roi_x2]
+
+        # 阶段三：将 ROI 居中放置于 128×128 黑色画布
         size = CONFIG["OUTPUT_SIZE"]
         canvas = np.zeros((size, size, 3), dtype=np.uint8)
+        cur_h, cur_w = minimap.shape[:2]
+        if cur_h == 0 or cur_w == 0:
+            return canvas
 
-        dst_x = max(0, (size - w) // 2)
-        dst_y = max(0, (size - h) // 2)
-        src_x = max(0, (w - size) // 2)
-        src_y = max(0, (h - size) // 2)
+        dst_x = max(0, (size - cur_w) // 2)
+        dst_y = max(0, (size - cur_h) // 2)
+        src_x = max(0, (cur_w - size) // 2)
+        src_y = max(0, (cur_h - size) // 2)
+        copy_w = min(cur_w - src_x, size - dst_x)
+        copy_h = min(cur_h - src_y, size - dst_y)
 
-        copy_w = min(w, size, size - dst_x, w - src_x)
-        copy_h = min(h, size, size - dst_y, h - src_y)
-
-        canvas[dst_y : dst_y + copy_h, dst_x : dst_x + copy_w] = img[
+        canvas[dst_y : dst_y + copy_h, dst_x : dst_x + copy_w] = minimap[
             src_y : src_y + copy_h, src_x : src_x + copy_w
         ]
 
-        # 3. Apply Circular Mask
+        # 阶段四：圆形 Mask，消除小地图外框噪声
         mask = np.zeros((size, size), dtype=np.uint8)
         cv2.circle(mask, (size // 2, size // 2), CONFIG["MASK_DIAMETER"] // 2, 255, -1)
 
         return cv2.bitwise_and(canvas, canvas, mask=mask)
 
-    def predict(self, image_path: str, save_debug: bool = False):
+    def predict(self, image_path: str, save_debug: bool = False) -> list[tuple[str, float]]:
+        """对单张图片执行推理，返回按置信度降序排列的类别结果。
+
+        Args:
+            image_path: 输入图片路径。
+            save_debug: 为 True 时将预处理结果保存为 debug_inference.jpg。
+
+        Returns:
+            列表，每项为 (class_name, confidence) 元组，按置信度降序排列。
+
+        Raises:
+            FileNotFoundError: 图片文件不存在时抛出。
+            ValueError:        图片无法被 OpenCV 读取时抛出。
+        """
         path = Path(image_path)
         if not path.exists():
             raise FileNotFoundError(f"Image not found: {path}")
 
-        img = cv2.imread(str(path))
+        img = safe_imread(path)
         if img is None:
             raise ValueError(f"Failed to read image: {path}")
 
@@ -101,26 +182,35 @@ class Predictor:
 
         results = self.model(processed, verbose=False)
 
-        # Return top result
-        top1 = results[0].probs.top1
-        return results[0].names[top1], results[0].probs.top1conf.item()
+        probs = results[0].probs.data.tolist()
+        names = results[0].names
+        all_results = [(names[i], conf) for i, conf in enumerate(probs)]
+        all_results.sort(key=lambda x: x[1], reverse=True)
+        return all_results
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Inference Script")
-    parser.add_argument("image", help="Path to test image")
+    parser = argparse.ArgumentParser(description="YOLO Classification Inference Script")
+    parser.add_argument("image", help="Path to the input image")
     parser.add_argument(
-        "--model", default=None, help="Model path (optional, defaults to latest run)"
+        "--model",
+        default=None,
+        help="Path to model weights (optional, defaults to latest training run)",
     )
     parser.add_argument(
-        "--debug", action="store_true", help="Save preprocessed debug image"
+        "--debug",
+        action="store_true",
+        help="Save the preprocessed image as debug_inference.jpg",
     )
 
     args = parser.parse_args()
 
     try:
         engine = Predictor(args.model)
-        name, conf = engine.predict(args.image, args.debug)
-        print(f"\n>>> Prediction: {name} ({conf:.2%})\n")
+        predictions = engine.predict(args.image, args.debug)
+        print("\n>>> Predictions:")
+        for name, conf in predictions:
+            print(f"  {name}: {conf:.2%}")
+        print()
     except Exception as e:
         logger.error(f"Error: {e}")

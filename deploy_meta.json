@@ -1,0 +1,8 @@
+{
+    "input_name": "images",
+    "output_name": "output0",
+    "region_mapping": {
+        "Map01": "ValleyIV",
+        "Map02": "Wuling"
+    }
+}
