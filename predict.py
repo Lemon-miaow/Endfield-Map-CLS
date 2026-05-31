@@ -14,6 +14,8 @@ predict.py — 单图推理脚本
     python predict.py <image_path> [--model <path>] [--debug]
 """
 
+from __future__ import annotations
+
 import argparse
 import logging
 from pathlib import Path
@@ -33,6 +35,12 @@ CONFIG = {
     "ROI_Y": 51,
     "ROI_W": 118,
     "ROI_H": 120,
+}
+
+DEFAULT_OPTIONS = {
+    "model": None,
+    "debug": False,
+    "debug_path": "debug_inference.jpg",
 }
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -58,7 +66,6 @@ class Predictor:
         self.model_path = self._resolve_model_path(model_path)
         logger.info(f"Loading model: {self.model_path}")
         self.model = YOLO(str(self.model_path))
-        self.scale_ratio = CONFIG["TARGET_RES_H"] / CONFIG["GAME_RES_H"]
 
     def _resolve_model_path(self, model_path: str) -> Path:
         """解析模型路径，未指定时自动发现最新的训练结果。
@@ -108,12 +115,13 @@ class Predictor:
         Returns:
             经预处理的 OUTPUT_SIZE×OUTPUT_SIZE BGR 图像。
         """
-        # 阶段一：缩放至 720p 基准（TARGET_RES_H == GAME_RES_H 时跳过）
-        if self.scale_ratio != 1.0:
-            h, w = img.shape[:2]
+        # 阶段一：按输入截图的实际高度自动缩放到 720p 基准
+        h, w = img.shape[:2]
+        scale_ratio = CONFIG["TARGET_RES_H"] / float(h)
+        if abs(scale_ratio - 1.0) > 1e-6:
             img = cv2.resize(
                 img,
-                (int(w * self.scale_ratio), int(h * self.scale_ratio)),
+                (int(round(w * scale_ratio)), CONFIG["TARGET_RES_H"]),
                 interpolation=cv2.INTER_AREA,
             )
 
@@ -151,12 +159,18 @@ class Predictor:
 
         return cv2.bitwise_and(canvas, canvas, mask=mask)
 
-    def predict(self, image_path: str, save_debug: bool = False) -> list[tuple[str, float]]:
+    def predict(
+        self,
+        image_path: str,
+        save_debug: bool = False,
+        debug_path: str = DEFAULT_OPTIONS["debug_path"],
+    ) -> list[tuple[str, float]]:
         """对单张图片执行推理，返回按置信度降序排列的类别结果。
 
         Args:
             image_path: 输入图片路径。
             save_debug: 为 True 时将预处理结果保存为 debug_inference.jpg。
+            debug_path: 预处理结果的保存路径。
 
         Returns:
             列表，每项为 (class_name, confidence) 元组，按置信度降序排列。
@@ -176,7 +190,6 @@ class Predictor:
         processed = self.preprocess(img)
 
         if save_debug:
-            debug_path = "debug_inference.jpg"
             cv2.imwrite(debug_path, processed)
             logger.info(f"Debug image saved to: {debug_path}")
 
@@ -189,25 +202,37 @@ class Predictor:
         return all_results
 
 
-if __name__ == "__main__":
+def parse_args() -> argparse.Namespace:
+    """解析推理输入和命令行覆盖项。"""
     parser = argparse.ArgumentParser(description="YOLO Classification Inference Script")
     parser.add_argument("image", help="Path to the input image")
     parser.add_argument(
         "--model",
-        default=None,
+        default=argparse.SUPPRESS,
         help="Path to model weights (optional, defaults to latest training run)",
     )
     parser.add_argument(
         "--debug",
         action="store_true",
+        default=argparse.SUPPRESS,
         help="Save the preprocessed image as debug_inference.jpg",
     )
+    parser.add_argument(
+        "--debug-path",
+        default=argparse.SUPPRESS,
+        help=f"Path for debug image output (default: {DEFAULT_OPTIONS['debug_path']})",
+    )
 
-    args = parser.parse_args()
+    options = DEFAULT_OPTIONS.copy()
+    options.update(vars(parser.parse_args()))
+    return argparse.Namespace(**options)
 
+
+if __name__ == "__main__":
+    args = parse_args()
     try:
         engine = Predictor(args.model)
-        predictions = engine.predict(args.image, args.debug)
+        predictions = engine.predict(args.image, args.debug, args.debug_path)
         print("\n>>> Predictions:")
         for name, conf in predictions:
             print(f"  {name}: {conf:.2%}")

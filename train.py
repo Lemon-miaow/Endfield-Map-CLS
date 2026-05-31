@@ -13,6 +13,8 @@ train.py — YOLO 分类器训练脚本
                     [--device <id>] [--name <str>]
 """
 
+from __future__ import annotations
+
 import argparse
 import logging
 from pathlib import Path
@@ -22,14 +24,20 @@ from ultralytics import YOLO
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
-# 训练默认超参数（可通过 CLI 参数覆盖）
+# 训练默认配置；命令行参数只作为覆盖项，不作为配置来源。
 DEFAULT_CONFIG = {
+    "data": "dataset",  # 数据集根目录
     "model": "auto",   # 权重路径，"auto" 表示自动发现最新历史权重
     "imgsz": 128,      # 训练输入图像尺寸（正方形边长）
     "batch": 128,      # 每步训练的样本数
     "workers": 6,      # DataLoader 并行工作线程数
     "patience": 20,    # 早停等待轮数（验证指标无提升时触发）
     "epochs": 200,     # 最大训练轮数
+    "device": "0",     # CUDA 设备；可传 cpu
+    "project": "runs/classify",
+    "name": "train",
+    "erasing": 0.0,
+    "auto_augment": None,
 }
 
 
@@ -65,12 +73,18 @@ def train(args: argparse.Namespace) -> None:
     model_path = args.model
 
     if model_path == "auto":
-        latest_pt = find_latest_model()
+        latest_pt = find_latest_model(args.project)
         if latest_pt:
-            logger.info(f"[Auto-Detect] Found latest weights, resuming incremental fine-tuning: {latest_pt}")
+            logger.info(
+                "[Auto-Detect] Found latest weights, "
+                f"resuming incremental fine-tuning: {latest_pt}"
+            )
             model_path = latest_pt
         else:
-            logger.info("[Auto-Detect] No previous weights found. Starting from base model: yolo26s-cls.pt")
+            logger.info(
+                "[Auto-Detect] No previous weights found. "
+                "Starting from base model: yolo26s-cls.pt"
+            )
             model_path = "yolo26s-cls.pt"
     else:
         logger.info(f"Using specified weights: {model_path}")
@@ -85,66 +99,89 @@ def train(args: argparse.Namespace) -> None:
         workers=args.workers,
         device=args.device,
         patience=args.patience,
-        erasing=0.6,
-        auto_augment="randaugment",
+        erasing=args.erasing,
+        auto_augment=args.auto_augment,
         save=True,
-        project="runs/classify",
-        name=args.name or "train",
+        project=args.project,
+        name=args.name,
     )
 
 
-if __name__ == "__main__":
+def parse_args() -> argparse.Namespace:
+    """解析命令行覆盖项，并与 DEFAULT_CONFIG 合并。"""
     parser = argparse.ArgumentParser(description="YOLO Classification Training Script")
     parser.add_argument(
         "--data",
-        default="dataset",
-        help="Path to dataset root directory (default: dataset)",
+        default=argparse.SUPPRESS,
+        help=f"Path to dataset root directory (default: {DEFAULT_CONFIG['data']})",
     )
     parser.add_argument(
         "--model",
-        default=DEFAULT_CONFIG["model"],
-        help="Model weights path, or 'auto' to resume from latest run (default: auto)",
+        default=argparse.SUPPRESS,
+        help=f"Model weights path, or 'auto' (default: {DEFAULT_CONFIG['model']})",
     )
     parser.add_argument(
         "--epochs",
         type=int,
-        default=DEFAULT_CONFIG["epochs"],
+        default=argparse.SUPPRESS,
         help=f"Number of training epochs (default: {DEFAULT_CONFIG['epochs']})",
     )
     parser.add_argument(
         "--imgsz",
         type=int,
-        default=DEFAULT_CONFIG["imgsz"],
+        default=argparse.SUPPRESS,
         help=f"Input image size (default: {DEFAULT_CONFIG['imgsz']})",
     )
     parser.add_argument(
         "--batch",
         type=int,
-        default=DEFAULT_CONFIG["batch"],
+        default=argparse.SUPPRESS,
         help=f"Batch size (default: {DEFAULT_CONFIG['batch']})",
     )
     parser.add_argument(
         "--workers",
         type=int,
-        default=DEFAULT_CONFIG["workers"],
+        default=argparse.SUPPRESS,
         help=f"Number of DataLoader workers (default: {DEFAULT_CONFIG['workers']})",
     )
     parser.add_argument(
         "--patience",
         type=int,
-        default=DEFAULT_CONFIG["patience"],
+        default=argparse.SUPPRESS,
         help=f"Early stopping patience in epochs (default: {DEFAULT_CONFIG['patience']})",
     )
     parser.add_argument(
         "--device",
-        default="0",
-        help="CUDA device index or ID (e.g. 0, 0,1, cpu)",
+        default=argparse.SUPPRESS,
+        help=f"CUDA device index or ID (default: {DEFAULT_CONFIG['device']})",
     )
     parser.add_argument(
         "--name",
-        default=None,
-        help="Experiment name for the training run output directory",
+        default=argparse.SUPPRESS,
+        help=f"Experiment name for output directory (default: {DEFAULT_CONFIG['name']})",
+    )
+    parser.add_argument(
+        "--project",
+        default=argparse.SUPPRESS,
+        help=f"Training output root directory (default: {DEFAULT_CONFIG['project']})",
+    )
+    parser.add_argument(
+        "--erasing",
+        type=float,
+        default=argparse.SUPPRESS,
+        help=f"Random erasing strength passed to YOLO (default: {DEFAULT_CONFIG['erasing']})",
+    )
+    parser.add_argument(
+        "--auto-augment",
+        dest="auto_augment",
+        default=argparse.SUPPRESS,
+        help="YOLO auto augment policy override (default: disabled)",
     )
 
-    args = parser.parse_args()
-    train(args)
+    config = DEFAULT_CONFIG.copy()
+    config.update(vars(parser.parse_args()))
+    return argparse.Namespace(**config)
+
+
+if __name__ == "__main__":
+    train(parse_args())
