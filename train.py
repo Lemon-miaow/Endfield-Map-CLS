@@ -6,6 +6,8 @@ train.py — YOLO 分类器训练脚本
                   作为增量微调起点；若不存在历史权重则从 yolo26s-cls.pt 底模开始训练。
     显式指定      通过 --model 传入具体 .pt 路径，强制使用该权重初始化。
 
+训练期间按最低 val/loss 保存 best.pt 和执行早停，使正确类别的置信度退化能够参与选优。
+
 用法:
     python train.py [--data <dir>] [--model <path|auto>]
                     [--epochs <int>] [--imgsz <int>] [--batch <int>]
@@ -17,9 +19,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+from copy import copy
 from pathlib import Path
 
+import torch
 from ultralytics import YOLO
+from ultralytics.models.yolo.classify import ClassificationTrainer, ClassificationValidator
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -30,7 +35,7 @@ DEFAULT_CONFIG = {
     "model": "auto",   # 权重路径，"auto" 表示自动发现最新历史权重
     "imgsz": 128,      # 训练输入图像尺寸（正方形边长）
     "batch": 128,      # 每步训练的样本数
-    "workers": 6,      # DataLoader 并行工作线程数
+    "workers": 24,     # DataLoader 并行工作线程数
     "patience": 20,    # 早停等待轮数（验证指标无提升时触发）
     "epochs": 200,     # 最大训练轮数
     "device": "0",     # CUDA 设备；可传 cpu
@@ -39,6 +44,77 @@ DEFAULT_CONFIG = {
     "erasing": 0.0,
     "auto_augment": None,
 }
+
+
+class ValidationLossValidator(ClassificationValidator):
+    """使用验证损失选择对正确类别更有把握的检查点。"""
+
+    def _log_fixed_predictions(self, trainer) -> None:
+        """输出固定验证图的目标类别置信度与 top1。"""
+        if getattr(trainer, "rank", -1) not in {-1, 0}:
+            return
+
+        dataset = self.dataloader.dataset
+        fixed_samples = [
+            (index, path, target)
+            for index, (path, target, *_rest) in enumerate(dataset.samples)
+            if Path(path).name.startswith("fixed_")
+        ]
+        if not fixed_samples:
+            return
+
+        images = torch.stack([dataset[index]["img"] for index, *_ in fixed_samples])
+        model = trainer.ema.ema or trainer.model
+        if trainer.args.compile and hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+
+        with torch.inference_mode():
+            output = model(images.to(self.device).float())
+            if isinstance(output, (tuple, list)):
+                output = output[0]
+            probabilities = output.softmax(1).cpu()
+
+        for probability, (_index, _path, target) in zip(probabilities, fixed_samples):
+            predicted = int(probability.argmax())
+            status = "OK" if predicted == target else "MISS"
+            logger.info(
+                f"[Fixed Val][{trainer.epoch + 1}/{trainer.epochs}] "
+                f"{self.names[target]} {status}: "
+                f"target={probability[target]:.2%}, "
+                f"top1={self.names[predicted]} {probability[predicted]:.2%}"
+            )
+
+    def __call__(self, trainer=None, model=None):
+        metrics = super().__call__(trainer, model)
+        if trainer is not None:
+            self._log_fixed_predictions(trainer)
+        if isinstance(metrics, dict) and "val/loss" in metrics:
+            metrics["fitness"] = 1.0 / (1.0 + metrics["val/loss"])
+        return metrics
+
+
+class ValidationLossTrainer(ClassificationTrainer):
+    """让 best.pt 和早停由最低验证损失决定。"""
+
+    def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode="train"):
+        loader = super().get_dataloader(
+            dataset_path,
+            batch_size=batch_size,
+            rank=rank,
+            mode=mode,
+        )
+        if mode != "train" and self.args.compile:
+            loader.batch_sampler.sampler.drop_last = False
+        return loader
+
+    def get_validator(self):
+        self.loss_names = ["loss"]
+        return ValidationLossValidator(
+            self.test_loader,
+            self.save_dir,
+            args=copy(self.args),
+            _callbacks=self.callbacks,
+        )
 
 
 def find_latest_model(base_dir: str = "runs/classify") -> str | None:
@@ -92,6 +168,7 @@ def train(args: argparse.Namespace) -> None:
     model = YOLO(model_path)
 
     model.train(
+        trainer=ValidationLossTrainer,
         data=args.data,
         epochs=args.epochs,
         imgsz=args.imgsz,
