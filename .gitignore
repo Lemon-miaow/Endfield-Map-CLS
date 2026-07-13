@@ -34,6 +34,14 @@ ENV/
 .vscode/
 *.swp
 *.swo
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# Tooling
+.autodl/
+.antigravitycli/
 
 # Project Specific
 dataset/
@@ -42,6 +50,22 @@ debug_*.jpg
 *.pt
 !yolo26n-cls.pt
 !yolo26n.pt
+
+# 背景域随机化素材，体积大且可自行采集
+bg_images/
+
+# 采集与人工核对的中间产物
+frame2png/
+rawscap/
+raw_failures/
+processed_errors/
+review_grids/
+tile_grid_preview/
+tile_grid_preview_160/
+
+# 仓库根目录下的截图与打包文件
+/*.png
+/*.zip
 
 # Temporary
 temp/
