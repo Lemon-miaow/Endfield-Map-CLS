@@ -12,6 +12,7 @@ None 类负样本、困难样本过采样和 UI/背景域随机化。默认配�
             *.png / *.jpg
 
     error_images/<class_name>/      困难样本目录；图片会按 ERROR_OVERSAMPLE 并入训练集
+    val_images/<class_name>/        已按推理规格裁好的固定验证样本
     bg_images/                      背景域随机化图片目录（可选）
     dataset/                        输出数据集根目录，运行前自动清空
 
@@ -63,6 +64,13 @@ CONFIG = {
     "UI_BLUE_PROB": 0.5,
     "UI_ICON_MIN_COUNT": 2,
     "UI_ICON_MAX_COUNT": 6,
+    "UI_ZONE_EXTRA_RATIO": 0.50,
+    "UI_ZONE_YELLOW_PROB": 0.75,
+    "UI_ZONE_ALPHA_MIN": 0.20,
+    "UI_ZONE_ALPHA_MAX": 0.34,
+    "UI_ZONE_MIN_RADIUS": 28,
+    "UI_ZONE_MAX_RADIUS": 40,
+    "UI_ZONE_EDGE_LEAK_PROB": 0.35,
     "EXTREME_UI_PROB": 0.06,
     "EXTREME_UI_PACK_MIN": 1,
     "EXTREME_UI_PACK_MAX": 2,
@@ -85,6 +93,7 @@ DEFAULT_OPTIONS = {
     "output": "dataset",
     "error": "error_images",
     "bg": "bg_images",
+    "fixed_val": "val_images",
     "workers": None,
 }
 
@@ -359,6 +368,40 @@ def add_extreme_icon_clutter(result: np.ndarray, normal_icons: dict, icon_names:
                 out = draw_one_normal_icon(out, icon, x, y)
 
     return out
+
+
+def draw_zone_overlay(img: np.ndarray) -> np.ndarray:
+    """绘制与游戏样式接近的黄色或浅蓝色任务范围圈。"""
+    h, w = img.shape[:2]
+    radius = random.randint(
+        CONFIG["UI_ZONE_MIN_RADIUS"],
+        CONFIG["UI_ZONE_MAX_RADIUS"],
+    )
+    map_radius = CONFIG["MASK_DIAMETER"] / 2
+    center_angle = random.uniform(0, math.tau)
+    center_distance = math.sqrt(random.random()) * (map_radius - 1)
+    if random.random() < CONFIG["UI_ZONE_EDGE_LEAK_PROB"]:
+        center_distance = random.uniform(map_radius - 8, map_radius - 1)
+    cx = round(w / 2 + math.cos(center_angle) * center_distance)
+    cy = round(h / 2 + math.sin(center_angle) * center_distance)
+
+    fill_color = (
+        (28, 168, 185)
+        if random.random() < CONFIG["UI_ZONE_YELLOW_PROB"]
+        else (235, 205, 135)
+    )
+    alpha = random.uniform(
+        CONFIG["UI_ZONE_ALPHA_MIN"],
+        CONFIG["UI_ZONE_ALPHA_MAX"],
+    )
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(mask, (cx, cy), radius, 255, -1, lineType=cv2.LINE_AA)
+    mask = cv2.GaussianBlur(mask, (0, 0), random.uniform(0.6, 1.2))
+    blend = mask.astype(np.float32)[..., None] * (alpha / 255.0)
+    color = np.asarray(fill_color, dtype=np.float32)
+    result = img.astype(np.float32) * (1.0 - blend) + color * blend
+    return np.clip(result, 0, 255).astype(np.uint8)
 
 
 def draw_random_ui_lines(img: np.ndarray) -> np.ndarray:
@@ -660,14 +703,8 @@ def add_central_ui_simulation(img: np.ndarray, feature_strength: float | None = 
     return result
 
 
-def augment_patch(patch: np.ndarray, safe_size: int) -> np.ndarray:
-    """对普通类别样本执行完整增强。"""
-    if random.random() < 0.15:
-        patch = add_photometric_distortion(patch)
-
-    if random.random() < 0.85:
-        patch = add_central_ui_simulation(patch)
-
+def apply_minimap_mask(img: np.ndarray) -> np.ndarray:
+    """清除圆形小地图区域外的增强内容。"""
     mask = np.zeros((CONFIG["OUTPUT_SIZE"], CONFIG["OUTPUT_SIZE"]), dtype=np.uint8)
     cv2.circle(
         mask,
@@ -676,8 +713,18 @@ def augment_patch(patch: np.ndarray, safe_size: int) -> np.ndarray:
         255,
         -1,
     )
-    patch = cv2.bitwise_and(patch, patch, mask=mask)
-    return patch
+    return cv2.bitwise_and(img, img, mask=mask)
+
+
+def augment_patch(patch: np.ndarray, safe_size: int) -> np.ndarray:
+    """对普通类别样本执行完整增强。"""
+    if random.random() < 0.15:
+        patch = add_photometric_distortion(patch)
+
+    if random.random() < 0.85:
+        patch = add_central_ui_simulation(patch)
+
+    return apply_minimap_mask(patch)
 
 
 def augment_patch_light(patch: np.ndarray) -> np.ndarray:
@@ -688,15 +735,19 @@ def augment_patch_light(patch: np.ndarray) -> np.ndarray:
     if random.random() < 0.85:
         patch = add_central_ui_simulation(patch)
 
-    mask = np.zeros((CONFIG["OUTPUT_SIZE"], CONFIG["OUTPUT_SIZE"]), dtype=np.uint8)
-    cv2.circle(
-        mask,
-        (CONFIG["OUTPUT_SIZE"] // 2, CONFIG["OUTPUT_SIZE"] // 2),
-        CONFIG["MASK_DIAMETER"] // 2,
-        255,
-        -1,
-    )
-    return cv2.bitwise_and(patch, patch, mask=mask)
+    return apply_minimap_mask(patch)
+
+
+def augment_zone_patch(patch: np.ndarray) -> np.ndarray:
+    """生成一个必定包含区域圈的额外地图样本。"""
+    if random.random() < 0.15:
+        patch = add_photometric_distortion(patch)
+
+    patch = draw_zone_overlay(patch)
+    if random.random() < 0.85:
+        patch = add_central_ui_simulation(patch)
+
+    return apply_minimap_mask(patch)
 
 
 # ---------------------------------------------------------------------------
@@ -775,6 +826,19 @@ def apply_background_composition(patch_bgra: np.ndarray, bg_paths: list) -> np.n
 # ---------------------------------------------------------------------------
 
 
+def compose_patch(
+    img: np.ndarray,
+    cx: int,
+    cy: int,
+    angle: float,
+    safe_size: int,
+    bg_paths: list,
+) -> np.ndarray:
+    """提取图块并合成背景。"""
+    patch_bgra = extract_roi(img, cx, cy, angle, safe_size)
+    return apply_background_composition(patch_bgra, bg_paths)
+
+
 def process_patch(
     img: np.ndarray,
     cx: int,
@@ -785,8 +849,7 @@ def process_patch(
     light_aug: bool = False,
 ) -> np.ndarray:
     """提取单个训练图块，并完成背景合成与增强。"""
-    patch_bgra = extract_roi(img, cx, cy, angle, safe_size)
-    patch_bgr = apply_background_composition(patch_bgra, bg_paths)
+    patch_bgr = compose_patch(img, cx, cy, angle, safe_size, bg_paths)
 
     if light_aug:
         return augment_patch_light(patch_bgr)
@@ -825,7 +888,7 @@ def generate_samples(
     light_aug: bool = False,
     random_sampling_only: bool = False,
 ) -> list:
-    """从单张地图切片生成 TARGET_COUNT 个增强样本。
+    """生成 TARGET_COUNT 个基础样本，并为地图类追加区域圈干扰样本。
 
     sample_region:
         (x, y, w, h)，坐标相对于原图（未 pad）。
@@ -900,6 +963,16 @@ def generate_samples(
             else:
                 samples.append(augment_patch(patch_bgr, safe_size))
 
+    if random_sampling_only:
+        return samples
+
+    zone_count = round(target_count * CONFIG["UI_ZONE_EXTRA_RATIO"])
+    zone_samples = []
+    for _ in range(zone_count):
+        cx, cy = random.choice(valid_centers)
+        patch_bgr = compose_patch(img, cx, cy, 0, safe_size, bg_paths)
+        zone_samples.append(augment_zone_patch(patch_bgr))
+    samples.extend(zone_samples)
     return samples
 
 
@@ -936,6 +1009,27 @@ def save_dataset(samples: list, class_name: str, file_stem: str, output_dir: Pat
 
     for i, img in enumerate(val_samples):
         safe_imwrite(val_class_dir / f"{file_stem}_{i:05d}.jpg", img)
+
+
+def copy_fixed_validation_samples(fixed_val_dir: Path, output_dir: Path) -> int:
+    """将人工确认的预处理样本原样加入验证集。"""
+    if not fixed_val_dir.exists():
+        return 0
+
+    copied = 0
+    class_dirs = sorted(
+        path
+        for path in fixed_val_dir.iterdir()
+        if path.is_dir() and not path.name.startswith(".")
+    )
+    for class_dir in class_dirs:
+        target_dir = output_dir / "val" / class_dir.name
+        for pattern in ("*.[pP][nN][gG]", "*.[jJ][pP][gG]"):
+            for source_path in sorted(class_dir.glob(pattern)):
+                target_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_path, target_dir / f"fixed_{source_path.name}")
+                copied += 1
+    return copied
 
 
 # ---------------------------------------------------------------------------
@@ -1045,11 +1139,13 @@ class DataPreprocessor:
         output_dir: str,
         error_dir: str,
         bg_dir: str,
+        fixed_val_dir: str,
         max_workers: int | None = None,
     ):
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
         self.error_dir = Path(error_dir) if error_dir else None
+        self.fixed_val_dir = Path(fixed_val_dir)
         self.max_workers = max_workers
 
         self.bg_paths: list[Path] = []
@@ -1139,6 +1235,12 @@ class DataPreprocessor:
             save_tile_mapping(merged_tile_mapping, self.output_dir)
             logger.info(f"Saved tile mapping with {len(merged_tile_mapping)} entries.")
 
+        fixed_val_count = copy_fixed_validation_samples(
+            self.fixed_val_dir,
+            self.output_dir,
+        )
+        logger.info(f"Added {fixed_val_count} fixed validation samples.")
+
         logger.info("Preprocessing completed successfully.")
 
 
@@ -1168,6 +1270,12 @@ def parse_args() -> argparse.Namespace:
         "--bg",
         default=argparse.SUPPRESS,
         help=f"Directory containing background images (default: {DEFAULT_OPTIONS['bg']})",
+    )
+    parser.add_argument(
+        "--fixed-val",
+        dest="fixed_val",
+        default=argparse.SUPPRESS,
+        help=f"Directory containing fixed validation samples (default: {DEFAULT_OPTIONS['fixed_val']})",
     )
     parser.add_argument(
         "--workers",
@@ -1253,5 +1361,6 @@ if __name__ == "__main__":
         args.output,
         args.error,
         args.bg,
+        args.fixed_val,
         args.workers,
     ).run()
