@@ -856,7 +856,8 @@ def compose_tier_context_patch(
         cv2.MORPH_ELLIPSE,
         (radius * 2 + 1, radius * 2 + 1),
     )
-    ring = cv2.dilate(active, kernel).astype(np.float32) / 255.0
+    ring = cv2.dilate(active, kernel)
+    ring = cv2.GaussianBlur(ring, (0, 0), sigmaX=3.0).astype(np.float32) / 255.0
     ring *= (1.0 - alpha) * CONFIG["TIER_CONTEXT_RING_ALPHA"]
     result = tier_bgr * alpha[..., None]
     result += parent_patch_bgr.astype(np.float32) * ring[..., None]
