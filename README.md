@@ -51,11 +51,10 @@ pip install ultralytics opencv-python numpy
 ```text
 source_images/  
 ├── Map01Base.png           # 大世界一区基础层  
-├── Map01Lv001Tier114/      # 以目录组织特定区域的多张切片  
-│   ├── slice_01.png  
-│   └── slice_02.png  
+├── Map01Lv001Tier114.png   # 导出的 Tier 模板（与 map_export.json 一一对应）
 └── None/                   # 纯净负样本池  
     └── loading_screen.png
+map_export.json              # 完整导出契约：Tier 与所属 Base 的仿射关系
 ```
 
 ### **2.数据集合成与增强**
@@ -66,13 +65,24 @@ source_images/
 python preprocess.py --input source_images --output dataset
 ```
 
+含 Tier 模板时，根目录的 `map_export.json` 是必需输入。它是导出工具生成的
+独立 JSON 契约；CLS 只读取其中的文件名、尺寸和 `tier_to_parent` 仿射，不导入
+Endfield-tools 或 MapTracker。缺少、过期或与 `source_images` 不一致时预处理会直接失败，
+避免悄悄生成没有父图上下文的 Tier 样本。也可以显式指定路径：
+
+```bash
+python preprocess.py --map-export map_export.json
+```
+
 **管线处理细节：**
 
-* **智能滑窗**：步长 40px，自动剔除低信息熵（单调/空旷）区块。  
-* **空间畸变**：随机旋转 (0°~360°)、缩放变换。  
+* **均衡滑窗**：步长 8px，自动剔除低信息熵区块，并按完整轮次均衡覆盖所有有效中心。
+* **空间扰动**：重复轮次使用不跨 tile 边界的 ±5px 位移和 ±0.5° 旋转。
 * **环境仿真**：光度畸变、UI 遮挡仿真、中心角色标记位仿真。  
+* **玩家指针**：所有地图正样本始终叠加中心玩家指针，普通图标与路线独立随机出现。
+* **任务圈增强**：普通类别默认保留 1200 张基础样本并额外生成 600 张黄色/浅蓝色圈样本；在默认 Base tile 配置下，train 中每个有效中心至少保留一组同位置普通/黄色圈样本。
 * **背景域泛化**：从 bg_images/ 中随机提取复杂纹理，替换地图边界之外的背景，大幅提升模型抗 UI 遮挡能力。  
-* **集划分**：单类别约生成 3000 样本，严格按 8:2 划分 train/val。
+* **集划分**：生成样本按 8:2 划分 train/val，人工困难样本只进入 train。
 
 ### **3.困难样本挖掘 (Active Learning)**
 
@@ -86,9 +96,13 @@ python init_error_dirs.py --source source_images --error error_images
 # 支持单图或整个目录的批量化 ROI 裁切  
 python preprocess_roi.py -i raw_failures/Map01Base -o error_images/Map01Base
 
-# 3. 触发携带困难样本的重构建（将对 error_images 施加 15 倍过采样权重）  
+# 3. 触发携带困难样本的重构建
 python preprocess.py --input source_images --output dataset --error error_images
 ```
+
+同一类别的困难样本只加载一次，默认每张至少重复 5 次；当现场样本很少时，会补足到该类生成样本量的 5%，确保它们具有实际训练权重，同时避免进入随机验证集造成数据泄漏。
+
+固定真实验证样本放在 `validation_images/<class_name>/`，必须是已经按线上推理规格处理好的 128×128 图片。`preprocess.py` 会校验标签与尺寸并自动复制到 `dataset/val`；训练时它们会独立计算损失，与生成验证集共同决定 `best.pt` 和 early-stop。详细约束见 [`validation_images/README.md`](validation_images/README.md)。
 
 ### **4.模型训练**
 
@@ -98,7 +112,7 @@ python preprocess.py --input source_images --output dataset --error error_images
 python train.py --epochs 200 --batch 128 --device 0
 ```
 
-**💡 提示：** 首次训练自动挂载 `yolov26s-cls.pt`。增量微调时，引擎会自动寻址 `runs/classify/` 下最新的 `best.pt` 作为起点。
+**💡 提示：** 首次训练自动挂载 `yolo26s-cls.pt`。增量微调时，引擎会自动寻址 `runs/classify/` 下最新的 `best.pt` 作为起点。
 
 ### **5.推理验证与导出**
 
@@ -144,9 +158,11 @@ Endfield-Map-CLS/
 ├── 📄 export.py             # 模型编译与导出工具  
 ├── 📄 init_error_dirs.py    # 工程初始化工具  
 ├── ⚙️ deploy_meta.json      # 部署元数据配置文件  
+├── 📄 map_export.json       # [Input] VFS 导出的 Tier→Base 契约
 │  
 ├── 📁 source_images/        # [Input] 基础素材集 (需自行准备)  
 ├── 📁 error_images/         # [Input] 困难样本池 (Active Learning)  
+├── 📁 validation_images/    # [Input] 可提交的固定真实验证集
 ├── 📁 bg_images/            # [Input] 背景域随机化素材池  
 │  
 ├── 📁 dataset/              # [Temp] 编译生成的训练集  

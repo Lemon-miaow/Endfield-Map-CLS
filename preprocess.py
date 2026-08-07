@@ -11,26 +11,30 @@ None 类负样本、困难样本过采样和 UI/背景域随机化。默认配�
         <class_name>/               子目录图片使用目录名作为类别名
             *.png / *.jpg
 
-    error_images/<class_name>/      困难样本目录；图片会按 ERROR_OVERSAMPLE 并入训练集
-    val_images/<class_name>/        已按推理规格裁好的固定验证样本
+    error_images/<class_name>/      困难样本目录；仅并入训练集，不参与随机验证集
+    validation_images/<class_name>/ 已按推理规格裁好的固定验证样本
     bg_images/                      背景域随机化图片目录（可选）
+    map_export.json                 完整 Tier→Base 导出契约（必须由导出工具生成）
     dataset/                        输出数据集根目录，运行前自动清空
 
 用法:
     python preprocess.py [--input <dir>] [--output <dir>]
                          [--error <dir>] [--bg <dir>]
-                         [--target-count <int>] [--workers <int>]
+                         [--map-export <json>] [--target-count <int>]
+                         [--workers <int>]
 """
 
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
 import logging
 import math
 import os
 import random
 import shutil
+from enum import IntEnum
 from pathlib import Path
 
 import cv2
@@ -51,10 +55,15 @@ CONFIG = {
     "VAL_RATIO": 0.2,                  # 验证集比例
     "STRIDE": 8,                       # 滑窗扫描步长
     "ANGLE_JITTER": 0.5,               # 随机旋转扰动角度
+    "SCALE_JITTER_RATIO": 0.25,         # 训练专用尺度扰动样本比例
+    "SCALE_JITTER_MIN": 0.90,
+    "SCALE_JITTER_MAX": 1.10,
+    "TIER_CENTER_DILATION": 8,          # Tier 中心只在地图结构附近采样
     "STD_THRESHOLD": 5.0,              # 保留兼容字段，实际有效性使用 MIN_VALID_STD
     "OCCLUSION_COUNT": 0,              # 保留兼容字段
     "OCCLUSION_SIZE": 0,               # 保留兼容字段
     "ERROR_OVERSAMPLE": 5,             # 困难样本过采样倍数
+    "ERROR_MIN_RATIO": 0.05,           # 困难样本至少占该类生成样本的比例
     "BACKGROUND_BLEND_RANGE": (0.9, 1.0),
     "BASE_CLASS_NAMES": {"Map01Base", "Map02Base"},
     "TILE_SIZE": 160,
@@ -80,20 +89,45 @@ CONFIG = {
     "EXTREME_UI_RADIUS_MAX": 22,
     "EXTREME_UI_CHAIN_PROB": 0.5,
     "EXTREME_UI_EDGE_BIAS_PROB": 0.35,
+    "ULTRA_UI_PROB": 0.01,
+    "ULTRA_UI_PACK_MIN": 3,
+    "ULTRA_UI_PACK_MAX": 4,
+    "ULTRA_UI_ICONS_MIN": 18,
+    "ULTRA_UI_ICONS_MAX": 28,
+    "ULTRA_UI_RADIUS_MIN": 16,
+    "ULTRA_UI_RADIUS_MAX": 32,
+    "ULTRA_UI_CHAIN_PROB": 0.85,
     "UI_POINTER_PROB": 1.0,
     "MIN_MAP_CIRCLE_COVERAGE": 0.10,
     "MIN_MAP_CENTER_COVERAGE": 0.035,
     "MIN_ALPHA_CIRCLE_COVERAGE": 0.12,
+    "TIER_MIN_MAP_CIRCLE_COVERAGE": 0.02,
+    "TIER_MIN_ALPHA_CIRCLE_COVERAGE": 0.08,
+    "TIER_CONTEXT_RING_RADIUS": 42,
+    "TIER_CONTEXT_RING_ALPHA": 0.25,
     "MIN_VALID_STD": 8.0,
     "MIN_VALID_CENTERS_PER_TILE": 24,
 }
+
+
+class UiClutter(IntEnum):
+    NONE = 0
+    EXTREME = 1
+    ULTRA = 2
+
+
+class BackgroundProfile(IntEnum):
+    STANDARD = 0
+    TIER = 1
+
 
 DEFAULT_OPTIONS = {
     "input": "source_images",
     "output": "dataset",
     "error": "error_images",
     "bg": "bg_images",
-    "fixed_val": "val_images",
+    "fixed_val": "validation_images",
+    "map_export": "map_export.json",
     "workers": None,
 }
 
@@ -131,6 +165,137 @@ def safe_imwrite(path, img):
     if is_success:
         buf.tofile(str(path))
     return is_success
+
+
+MAP_EXPORT_FORMAT = "map-cls-export-v1"
+
+
+def _resolve_export_file(input_dir: Path, value: str, field: str) -> Path:
+    """Resolve a manifest path while keeping it inside the source directory."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"map_export.json {field} must be a non-empty relative path")
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"map_export.json {field} must be relative: {value}")
+
+    # Accept both the portable form ``Map02Base.png`` and the descriptive
+    # ``source_images/Map02Base.png`` form from exported manifests.
+    if path.parts and path.parts[0] == input_dir.name:
+        path = Path(*path.parts[1:])
+    resolved_root = input_dir.resolve()
+    resolved = (input_dir / path).resolve()
+    if resolved != resolved_root and resolved_root not in resolved.parents:
+        raise ValueError(f"map_export.json {field} escapes the source directory: {value}")
+    return resolved
+
+
+def _manifest_size(value, field: str) -> tuple[int, int]:
+    if not isinstance(value, list) or len(value) != 2 or any(
+        isinstance(item, bool) or not isinstance(item, int) or item <= 0
+        for item in value
+    ):
+        raise ValueError(f"map_export.json {field} must be [positive_width, positive_height]")
+    return int(value[0]), int(value[1])
+
+
+def _manifest_affine(value, field: str) -> tuple[float, float, float, float]:
+    if not isinstance(value, list) or len(value) != 4:
+        raise ValueError(f"map_export.json {field} must contain four numbers")
+    affine = tuple(float(item) for item in value)
+    if not all(math.isfinite(item) for item in affine) or affine[0] <= 0 or affine[2] <= 0:
+        raise ValueError(f"map_export.json {field} contains an invalid affine")
+    return affine
+
+
+def load_map_export_manifest(path: Path, input_dir: Path) -> dict[str, dict]:
+    """Load the portable Tier-to-parent contract used by CLS.
+
+    The manifest contains only resolved facts (filenames, dimensions, and a
+    diagonal affine).  No exporter module is imported here, so the training
+    repository remains independent of the producer.
+    """
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise ValueError(f"Cannot read {path}: {error}") from error
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Invalid JSON in {path}: {error}") from error
+
+    actual_format = payload.get("format") if isinstance(payload, dict) else None
+    if actual_format != MAP_EXPORT_FORMAT:
+        raise ValueError(
+            f"{path} has format {actual_format!r}; expected {MAP_EXPORT_FORMAT!r}"
+        )
+    bases = payload.get("bases")
+    if not isinstance(bases, dict) or not bases:
+        raise ValueError(f"{path} must contain a non-empty 'bases' object")
+    for base_name, raw in sorted(bases.items()):
+        if not isinstance(base_name, str) or not base_name or not isinstance(raw, dict):
+            raise ValueError(f"Invalid Base entry in {path}: {base_name!r}")
+        base_path = _resolve_export_file(input_dir, raw.get("file", ""), "base.file")
+        base_size = _manifest_size(raw.get("size"), f"{base_name}.size")
+        base = safe_imread(base_path, cv2.IMREAD_UNCHANGED)
+        if base is None or tuple(base.shape[:2][::-1]) != base_size:
+            actual = None if base is None else (base.shape[1], base.shape[0])
+            raise ValueError(
+                f"{base_name} base mismatch: manifest={base_size}, actual={actual}, "
+                f"path={base_path}"
+            )
+    tiers = payload.get("tiers")
+    if not isinstance(tiers, dict) or not tiers:
+        raise ValueError(f"{path} must contain a non-empty 'tiers' object")
+
+    specs: dict[str, dict] = {}
+    for class_name, raw in sorted(tiers.items()):
+        if not isinstance(class_name, str) or not class_name or not isinstance(raw, dict):
+            raise ValueError(f"Invalid Tier entry in {path}: {class_name!r}")
+
+        template_path = _resolve_export_file(input_dir, raw.get("template", ""), "template")
+        parent_path = _resolve_export_file(input_dir, raw.get("parent", ""), "parent")
+        template_size = _manifest_size(raw.get("template_size"), f"{class_name}.template_size")
+        parent_size = _manifest_size(raw.get("parent_size"), f"{class_name}.parent_size")
+        affine = _manifest_affine(raw.get("tier_to_parent"), f"{class_name}.tier_to_parent")
+        mask_mode = raw.get("mask_mode", "opaque")
+        if mask_mode not in {"opaque", "bright"}:
+            raise ValueError(
+                f"{class_name}.mask_mode must be 'opaque' or 'bright', got {mask_mode!r}"
+            )
+
+        template = safe_imread(template_path, cv2.IMREAD_UNCHANGED)
+        parent = safe_imread(parent_path, cv2.IMREAD_UNCHANGED)
+        if template is None or tuple(template.shape[:2][::-1]) != template_size:
+            actual = None if template is None else (template.shape[1], template.shape[0])
+            raise ValueError(
+                f"{class_name} template mismatch: manifest={template_size}, actual={actual}, "
+                f"path={template_path}"
+            )
+        if parent is None or tuple(parent.shape[:2][::-1]) != parent_size:
+            actual = None if parent is None else (parent.shape[1], parent.shape[0])
+            raise ValueError(
+                f"{class_name} parent mismatch: manifest={parent_size}, actual={actual}, "
+                f"path={parent_path}"
+            )
+
+        specs[class_name] = {
+            "template_path": str(template_path),
+            "parent_path": str(parent_path),
+            "template_size": template_size,
+            "parent_size": parent_size,
+            "affine": affine,
+            "mask_mode": mask_mode,
+        }
+    return specs
+
+
+def load_curated_sample(path: Path) -> np.ndarray:
+    """读取人工样本并严格校验其已符合线上推理尺寸。"""
+    image = safe_imread(path)
+    expected_shape = (CONFIG["OUTPUT_SIZE"], CONFIG["OUTPUT_SIZE"])
+    if image is None or image.shape[:2] != expected_shape:
+        raise ValueError(
+            f"Curated sample must be {expected_shape[0]}x{expected_shape[1]}: {path}"
+        )
+    return image
 
 
 # ---------------------------------------------------------------------------
@@ -325,31 +490,48 @@ def sample_extreme_anchor(h: int, w: int) -> tuple[int, int]:
     return random.randint(x_low, x_high), random.randint(y_low, y_high)
 
 
-def add_extreme_icon_clutter(result: np.ndarray, normal_icons: dict, icon_names: list[str]) -> np.ndarray:
+def add_extreme_icon_clutter(
+    result: np.ndarray,
+    normal_icons: dict,
+    icon_names: list[str],
+    ui_clutter: UiClutter,
+) -> np.ndarray:
     """在局部区域叠加高密度图标，模拟强遮挡场景。"""
     if not icon_names:
         return result
 
     h, w = result.shape[:2]
     out = result.copy()
-
-    pack_count = random.randint(CONFIG["EXTREME_UI_PACK_MIN"], CONFIG["EXTREME_UI_PACK_MAX"])
+    ultra = ui_clutter == UiClutter.ULTRA
+    prefix = "ULTRA_UI" if ultra else "EXTREME_UI"
+    pack_count = random.randint(
+        CONFIG[f"{prefix}_PACK_MIN"],
+        CONFIG[f"{prefix}_PACK_MAX"],
+    )
+    chain_names = [name for name in icon_names if "common" in name.lower()]
 
     for _ in range(pack_count):
         cx, cy = sample_extreme_anchor(h, w)
-        radius = random.randint(CONFIG["EXTREME_UI_RADIUS_MIN"], CONFIG["EXTREME_UI_RADIUS_MAX"])
-        icon_count = random.randint(CONFIG["EXTREME_UI_ICONS_MIN"], CONFIG["EXTREME_UI_ICONS_MAX"])
+        radius = random.randint(
+            CONFIG[f"{prefix}_RADIUS_MIN"],
+            CONFIG[f"{prefix}_RADIUS_MAX"],
+        )
+        icon_count = random.randint(
+            CONFIG[f"{prefix}_ICONS_MIN"],
+            CONFIG[f"{prefix}_ICONS_MAX"],
+        )
 
-        if random.random() < CONFIG["EXTREME_UI_CHAIN_PROB"]:
+        if random.random() < CONFIG[f"{prefix}_CHAIN_PROB"]:
             angle = random.uniform(0, 2 * np.pi)
             step = random.randint(4, 8)
+            chain_name = random.choice(chain_names) if ultra and chain_names else None
 
             for i in range(icon_count):
                 t = (i - (icon_count - 1) / 2.0) * step
                 dx = int(round(np.cos(angle) * t + random.gauss(0, 2.0)))
                 dy = int(round(np.sin(angle) * t + random.gauss(0, 2.0)))
 
-                icon = _sample_normal_ui_icon(normal_icons, icon_names)
+                icon = _sample_normal_ui_icon(normal_icons, icon_names, chain_name)
                 ih, iw = icon.shape[:2]
                 x = min(max(cx + dx - iw // 2, 0), max(0, w - iw))
                 y = min(max(cy + dy - ih // 2, 0), max(0, h - ih))
@@ -370,7 +552,11 @@ def add_extreme_icon_clutter(result: np.ndarray, normal_icons: dict, icon_names:
     return out
 
 
-def draw_zone_overlay(img: np.ndarray) -> np.ndarray:
+ZONE_YELLOW_BGR = (28, 168, 185)
+ZONE_BLUE_BGR = (235, 205, 135)
+
+
+def draw_zone_overlay(img: np.ndarray, fill_color: tuple[int, int, int]) -> np.ndarray:
     """绘制与游戏样式接近的黄色或浅蓝色任务范围圈。"""
     h, w = img.shape[:2]
     radius = random.randint(
@@ -385,11 +571,6 @@ def draw_zone_overlay(img: np.ndarray) -> np.ndarray:
     cx = round(w / 2 + math.cos(center_angle) * center_distance)
     cy = round(h / 2 + math.sin(center_angle) * center_distance)
 
-    fill_color = (
-        (28, 168, 185)
-        if random.random() < CONFIG["UI_ZONE_YELLOW_PROB"]
-        else (235, 205, 135)
-    )
     alpha = random.uniform(
         CONFIG["UI_ZONE_ALPHA_MIN"],
         CONFIG["UI_ZONE_ALPHA_MAX"],
@@ -428,19 +609,29 @@ def draw_random_ui_lines(img: np.ndarray) -> np.ndarray:
     return overlay
 
 
-def add_real_ui_icons(img: np.ndarray, icon_dir: str = "icon") -> np.ndarray:
-    """叠加真实 UI 图标和中心指针，保持与游戏小地图遮挡形态接近。"""
+def get_ui_icon_assets(icon_dir: str = "icon") -> dict:
+    """返回当前进程缓存的 UI 图标资源。"""
     global _ui_icon_cache
     if _ui_icon_cache is None:
         _ui_icon_cache = load_ui_icons(icon_dir)
+    return _ui_icon_cache
 
-    if not _ui_icon_cache:
+
+def add_random_map_icons(
+    img: np.ndarray,
+    icon_dir: str = "icon",
+    ui_clutter: UiClutter = UiClutter.NONE,
+) -> np.ndarray:
+    """叠加可选地图图标，不包含始终存在的玩家指针。"""
+    ui_icons = get_ui_icon_assets(icon_dir)
+
+    if not ui_icons:
         return img
 
     h, w = img.shape[:2]
     result = img.copy()
 
-    normal_icons = _ui_icon_cache["normal"]
+    normal_icons = ui_icons["normal"]
     icon_names = list(normal_icons.keys())
     if icon_names:
         use_count = random.randint(CONFIG["UI_ICON_MIN_COUNT"], CONFIG["UI_ICON_MAX_COUNT"])
@@ -454,31 +645,41 @@ def add_real_ui_icons(img: np.ndarray, icon_dir: str = "icon") -> np.ndarray:
 
             result = draw_one_normal_icon(result, icon, x, y)
 
-        if random.random() < CONFIG["EXTREME_UI_PROB"]:
-            result = add_extreme_icon_clutter(result, normal_icons, icon_names)
-
-    pointer_icon = _ui_icon_cache["pointer"]
-    if pointer_icon is not None:
-        angle = random.uniform(0, 360)
-        ih, iw = pointer_icon.shape[:2]
-        center = (iw // 2, ih // 2)
-        M = cv2.getRotationMatrix2D(center, angle, 1.0)
-        rotated_pointer = cv2.warpAffine(
-            pointer_icon,
-            M,
-            (iw, ih),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0, 0),
-        )
-
-        ih, iw = rotated_pointer.shape[:2]
-        x = (w - iw) // 2
-        y = (h - ih) // 2
-
-        result = overlay_rgba_on_bgr(result, rotated_pointer, x, y)
+        if ui_clutter != UiClutter.NONE:
+            result = add_extreme_icon_clutter(
+                result,
+                normal_icons,
+                icon_names,
+                ui_clutter,
+            )
 
     return result
+
+
+def add_player_pointer(img: np.ndarray, icon_dir: str = "icon") -> np.ndarray:
+    """将玩家指针旋转后固定叠加在小地图中心。"""
+    ui_icons = get_ui_icon_assets(icon_dir)
+    pointer_icon = ui_icons.get("pointer") if ui_icons else None
+    if pointer_icon is None:
+        raise FileNotFoundError(f"Required player pointer is missing: {icon_dir}/pointer.png")
+
+    angle = random.uniform(0, 360)
+    ih, iw = pointer_icon.shape[:2]
+    center = (iw // 2, ih // 2)
+    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated_pointer = cv2.warpAffine(
+        pointer_icon,
+        matrix,
+        (iw, ih),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0),
+    )
+
+    h, w = img.shape[:2]
+    x = (w - iw) // 2
+    y = (h - ih) // 2
+    return overlay_rgba_on_bgr(img.copy(), rotated_pointer, x, y)
 
 
 def debug_pointer_alpha(icon_dir: str = "icon") -> None:
@@ -580,7 +781,9 @@ def load_image(path: Path, safe_size: int) -> np.ndarray:
         logger.warning(f"Failed to load {path}")
         return None
 
-    if img.ndim == 3 and img.shape[2] == 3:
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+    elif img.ndim == 3 and img.shape[2] == 3:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
 
     pad = safe_size // 2
@@ -589,13 +792,91 @@ def load_image(path: Path, safe_size: int) -> np.ndarray:
     )
 
 
-def extract_roi(img, cx: int, cy: int, angle: float, safe_size: int) -> np.ndarray:
+def premultiply_to_bgr(img: np.ndarray) -> np.ndarray:
+    """Convert an RGB/RGBA image to BGR, honoring transparent pixels."""
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.shape[2] == 3:
+        return img.copy()
+    alpha = img[..., 3].astype(np.float32)[..., None] / 255.0
+    return (img[..., :3].astype(np.float32) * alpha).astype(np.uint8)
+
+
+def build_tier_parent_context(
+    template_img: np.ndarray,
+    tier_spec: dict,
+    safe_size: int,
+) -> dict:
+    """Project the complete parent Base map into the Tier template frame."""
+    parent_path = Path(tier_spec["parent_path"])
+    parent = safe_imread(parent_path, cv2.IMREAD_UNCHANGED)
+    if parent is None:
+        raise ValueError(f"Failed to load Tier parent map: {parent_path}")
+
+    expected_size = tier_spec["parent_size"]
+    actual_size = (parent.shape[1], parent.shape[0])
+    if actual_size != expected_size:
+        raise ValueError(
+            f"Tier parent mismatch: manifest={expected_size}, actual={actual_size}, "
+            f"path={parent_path}"
+        )
+
+    parent_bgr = premultiply_to_bgr(parent)
+    height, width = template_img.shape[:2]
+    pad = safe_size // 2
+    x, y = np.meshgrid(
+        np.arange(width, dtype=np.float32) - pad,
+        np.arange(height, dtype=np.float32) - pad,
+    )
+    sx, tx, sy, ty = tier_spec["affine"]
+    parent_aligned = cv2.remap(
+        parent_bgr,
+        sx * x + tx,
+        sy * y + ty,
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
+    return {
+        "parent_aligned": parent_aligned,
+        "mask_mode": tier_spec["mask_mode"],
+    }
+
+
+def compose_tier_context_patch(
+    tier_patch_bgra: np.ndarray,
+    parent_patch_bgr: np.ndarray,
+) -> np.ndarray:
+    """Keep the Tier foreground while restoring its real parent-map context."""
+    tier_bgr = premultiply_to_bgr(tier_patch_bgra).astype(np.float32)
+    alpha = tier_patch_bgra[..., 3].astype(np.float32) / 255.0
+    active = (alpha > 10 / 255.0).astype(np.uint8) * 255
+    radius = CONFIG["TIER_CONTEXT_RING_RADIUS"]
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (radius * 2 + 1, radius * 2 + 1),
+    )
+    ring = cv2.dilate(active, kernel).astype(np.float32) / 255.0
+    ring *= (1.0 - alpha) * CONFIG["TIER_CONTEXT_RING_ALPHA"]
+    result = tier_bgr * alpha[..., None]
+    result += parent_patch_bgr.astype(np.float32) * ring[..., None]
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def extract_roi(
+    img,
+    cx: int,
+    cy: int,
+    angle: float,
+    safe_size: int,
+    scale: float = 1.0,
+) -> np.ndarray:
     """以中心点裁出 ROI，按需旋转后返回训练尺寸图块。"""
     half = safe_size // 2
     patch = img[cy - half : cy + half, cx - half : cx + half]
 
-    if angle != 0:
-        M = cv2.getRotationMatrix2D((half, half), angle, 1.0)
+    if angle != 0 or scale != 1.0:
+        M = cv2.getRotationMatrix2D((half, half), angle, scale)
         border_val = (0, 0, 0, 0) if patch.shape[2] == 4 else (0, 0, 0)
         patch = cv2.warpAffine(patch, M, (safe_size, safe_size), borderValue=border_val)
 
@@ -604,8 +885,23 @@ def extract_roi(img, cx: int, cy: int, angle: float, safe_size: int) -> np.ndarr
     return patch[start:end, start:end]
 
 
-def is_valid(patch: np.ndarray) -> bool:
+def is_valid(
+    patch: np.ndarray,
+    *,
+    min_map_circle_coverage: float | None = None,
+    min_alpha_circle_coverage: float | None = None,
+) -> bool:
     """判断图块是否包含足够地图内容，过滤空洞和碎片区域。"""
+    min_map_circle_coverage = (
+        CONFIG["MIN_MAP_CIRCLE_COVERAGE"]
+        if min_map_circle_coverage is None
+        else min_map_circle_coverage
+    )
+    min_alpha_circle_coverage = (
+        CONFIG["MIN_ALPHA_CIRCLE_COVERAGE"]
+        if min_alpha_circle_coverage is None
+        else min_alpha_circle_coverage
+    )
     size = CONFIG["OUTPUT_SIZE"]
     radius = CONFIG["MASK_DIAMETER"] // 2
     cy, cx = size // 2, size // 2
@@ -624,7 +920,7 @@ def is_valid(patch: np.ndarray) -> bool:
         bgr = (bgr * alpha).astype(np.uint8)
 
         alpha_circle_ratio = np.count_nonzero(alpha_bool & circle_bool) / circle_area
-        if alpha_circle_ratio < CONFIG["MIN_ALPHA_CIRCLE_COVERAGE"]:
+        if alpha_circle_ratio < min_alpha_circle_coverage:
             return False
     else:
         bgr = patch.copy()
@@ -635,7 +931,7 @@ def is_valid(patch: np.ndarray) -> bool:
     map_bool = (gray > 12) & alpha_bool & circle_bool
 
     map_circle_ratio = np.count_nonzero(map_bool) / circle_area
-    if map_circle_ratio < CONFIG["MIN_MAP_CIRCLE_COVERAGE"]:
+    if map_circle_ratio < min_map_circle_coverage:
         return False
 
     r = 30
@@ -695,11 +991,17 @@ def apply_synthetic_fog(patch: np.ndarray, feature_strength: float) -> np.ndarra
     return patch
 
 
-def add_central_ui_simulation(img: np.ndarray, feature_strength: float | None = None) -> np.ndarray:
-    """叠加中心 UI 干扰。"""
+def add_central_ui_simulation(
+    img: np.ndarray,
+    feature_strength: float | None = None,
+    ui_clutter: UiClutter = UiClutter.NONE,
+) -> np.ndarray:
+    """叠加可选路线和地图图标干扰。"""
     result = img.copy()
-    result = draw_random_ui_lines(result)
-    result = add_real_ui_icons(result, "icon")
+    line_passes = 3 if ui_clutter == UiClutter.ULTRA else 1
+    for _ in range(line_passes):
+        result = draw_random_ui_lines(result)
+    result = add_random_map_icons(result, "icon", ui_clutter)
     return result
 
 
@@ -716,36 +1018,52 @@ def apply_minimap_mask(img: np.ndarray) -> np.ndarray:
     return cv2.bitwise_and(img, img, mask=mask)
 
 
-def augment_patch(patch: np.ndarray, safe_size: int) -> np.ndarray:
+def finalize_positive_map_sample(img: np.ndarray) -> np.ndarray:
+    """为地图正样本补上必选玩家指针并重新收紧圆形遮罩。"""
+    return apply_minimap_mask(add_player_pointer(img))
+
+
+def augment_patch(
+    patch: np.ndarray,
+    safe_size: int,
+    ui_clutter: UiClutter = UiClutter.NONE,
+) -> np.ndarray:
     """对普通类别样本执行完整增强。"""
     if random.random() < 0.15:
         patch = add_photometric_distortion(patch)
 
-    if random.random() < 0.85:
-        patch = add_central_ui_simulation(patch)
+    if ui_clutter != UiClutter.NONE or random.random() < 0.85:
+        patch = add_central_ui_simulation(patch, ui_clutter=ui_clutter)
 
     return apply_minimap_mask(patch)
 
 
-def augment_patch_light(patch: np.ndarray) -> np.ndarray:
+def augment_patch_light(
+    patch: np.ndarray,
+    ui_clutter: UiClutter = UiClutter.NONE,
+) -> np.ndarray:
     """对 Tier 类执行较轻增强，避免过度扰动小样本类别。"""
     if random.random() < 0.15:
         patch = add_photometric_distortion(patch)
 
-    if random.random() < 0.85:
-        patch = add_central_ui_simulation(patch)
+    if ui_clutter != UiClutter.NONE or random.random() < 0.85:
+        patch = add_central_ui_simulation(patch, ui_clutter=ui_clutter)
 
     return apply_minimap_mask(patch)
 
 
-def augment_zone_patch(patch: np.ndarray) -> np.ndarray:
+def augment_zone_patch(
+    patch: np.ndarray,
+    fill_color: tuple[int, int, int],
+    ui_clutter: UiClutter = UiClutter.NONE,
+) -> np.ndarray:
     """生成一个必定包含区域圈的额外地图样本。"""
     if random.random() < 0.15:
         patch = add_photometric_distortion(patch)
 
-    patch = draw_zone_overlay(patch)
-    if random.random() < 0.85:
-        patch = add_central_ui_simulation(patch)
+    patch = draw_zone_overlay(patch, fill_color)
+    if ui_clutter != UiClutter.NONE or random.random() < 0.85:
+        patch = add_central_ui_simulation(patch, ui_clutter=ui_clutter)
 
     return apply_minimap_mask(patch)
 
@@ -757,7 +1075,11 @@ def augment_zone_patch(patch: np.ndarray) -> np.ndarray:
 _bg_cache: dict = {}
 
 
-def apply_background_composition(patch_bgra: np.ndarray, bg_paths: list) -> np.ndarray:
+def apply_background_composition(
+    patch_bgra: np.ndarray,
+    bg_paths: list,
+    profile: BackgroundProfile = BackgroundProfile.STANDARD,
+) -> np.ndarray:
     """将带透明通道的地图图块合成到背景域上。"""
     if patch_bgra.shape[2] != 4:
         return patch_bgra
@@ -770,7 +1092,7 @@ def apply_background_composition(patch_bgra: np.ndarray, bg_paths: list) -> np.n
     rand_val = random.random()
 
     # 保留少量真实背景干扰，主体仍贴近游戏黑底小地图。
-    if rand_val < 0.30 and bg_paths:
+    if profile != BackgroundProfile.TIER and rand_val < 0.30 and bg_paths:
         bg_path_str = str(random.choice(bg_paths))
 
         if bg_path_str not in _bg_cache:
@@ -803,7 +1125,7 @@ def apply_background_composition(patch_bgra: np.ndarray, bg_paths: list) -> np.n
         else:
             bg_patch = np.zeros((h, w, 3), dtype=np.float32)
 
-    elif rand_val < 0.80:
+    elif rand_val < 0.80 or profile == BackgroundProfile.TIER:
         bg_patch = np.zeros((h, w, 3), dtype=np.float32)
 
     elif rand_val < 0.90:
@@ -833,50 +1155,198 @@ def compose_patch(
     angle: float,
     safe_size: int,
     bg_paths: list,
+    scale: float = 1.0,
+    background_profile: BackgroundProfile = BackgroundProfile.STANDARD,
+    tier_context: dict | None = None,
 ) -> np.ndarray:
     """提取图块并合成背景。"""
-    patch_bgra = extract_roi(img, cx, cy, angle, safe_size)
-    return apply_background_composition(patch_bgra, bg_paths)
+    patch_bgra = extract_roi(img, cx, cy, angle, safe_size, scale)
+    if tier_context is not None:
+        parent_patch = extract_roi(
+            tier_context["parent_aligned"],
+            cx,
+            cy,
+            angle,
+            safe_size,
+            scale,
+        )
+        return compose_tier_context_patch(patch_bgra, parent_patch)
+    return apply_background_composition(patch_bgra, bg_paths, background_profile)
 
 
-def process_patch(
+def build_tier_center_mask(
     img: np.ndarray,
-    cx: int,
-    cy: int,
-    angle: float,
-    safe_size: int,
-    bg_paths: list,
-    light_aug: bool = False,
+    mask_mode: str = "opaque",
 ) -> np.ndarray:
-    """提取单个训练图块，并完成背景合成与增强。"""
-    patch_bgr = compose_patch(img, cx, cy, angle, safe_size, bg_paths)
+    """生成 Tier 地图结构及其邻近区域的合法中心掩码。"""
+    alpha = img[..., 3]
+    premultiplied = (
+        img[..., :3].astype(np.float32) * (alpha.astype(np.float32)[..., None] / 255.0)
+    ).astype(np.uint8)
+    gray = cv2.cvtColor(premultiplied, cv2.COLOR_BGR2GRAY)
+    gray_threshold = 18 if mask_mode == "bright" else 12
+    structure = ((alpha > 10) & (gray > gray_threshold)).astype(np.uint8)
+    radius = CONFIG["TIER_CENTER_DILATION"]
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (radius * 2 + 1, radius * 2 + 1),
+    )
+    return cv2.dilate(structure, kernel) > 0
 
-    if light_aug:
-        return augment_patch_light(patch_bgr)
 
-    return augment_patch(patch_bgr, safe_size)
+def build_balanced_schedule(items: list, count: int) -> list:
+    """按完整随机轮次均衡取样，使任意两项的出现次数最多相差一次。"""
+    if not items or count <= 0:
+        return []
+
+    schedule = []
+    while len(schedule) < count:
+        cycle = items.copy()
+        random.shuffle(cycle)
+        schedule.extend(cycle[: count - len(schedule)])
+    return schedule
 
 
-def load_error_images(class_name: str, error_dir: Path) -> list:
-    """加载指定类别的困难样本，并按配置过采样。"""
-    error_samples = []
+def build_ui_clutter_schedule(sample_count: int) -> list[UiClutter]:
+    """保持原密集比例，并将其中少量样本固定为超极端 UI。"""
+    extreme_count = round(sample_count * 0.85 * CONFIG["EXTREME_UI_PROB"])
+    ultra_count = round(sample_count * 0.85 * CONFIG["ULTRA_UI_PROB"])
+    if extreme_count:
+        ultra_count = min(extreme_count, max(1, ultra_count))
+
+    schedule = (
+        [UiClutter.ULTRA] * ultra_count
+        + [UiClutter.EXTREME] * (extreme_count - ultra_count)
+        + [UiClutter.NONE] * (sample_count - extreme_count)
+    )
+    random.shuffle(schedule)
+    return schedule
+
+
+def build_zone_ui_clutter_schedule(
+    zone_plan: list[tuple[tuple[int, int], tuple[int, int, int]]],
+) -> list[UiClutter]:
+    """分别保证黄圈与蓝圈样本中的密集强度覆盖。"""
+    schedule = [UiClutter.NONE] * len(zone_plan)
+    for fill_color in (ZONE_YELLOW_BGR, ZONE_BLUE_BGR):
+        indices = [
+            index
+            for index, (_center, color) in enumerate(zone_plan)
+            if color == fill_color
+        ]
+        for index, ui_clutter in zip(indices, build_ui_clutter_schedule(len(indices))):
+            schedule[index] = ui_clutter
+    return schedule
+
+
+def build_scale_jitter_schedule(sample_count: int) -> list[float]:
+    """按固定配额生成对称尺度扰动，其余样本保持原尺寸。"""
+    jitter_count = round(sample_count * CONFIG["SCALE_JITTER_RATIO"])
+    smaller_count = (jitter_count + 1) // 2
+    larger_count = jitter_count - smaller_count
+    schedule = [
+        random.uniform(CONFIG["SCALE_JITTER_MIN"], 1.0)
+        for _ in range(smaller_count)
+    ]
+    schedule.extend(
+        random.uniform(1.0, CONFIG["SCALE_JITTER_MAX"])
+        for _ in range(larger_count)
+    )
+    schedule.extend([1.0] * (sample_count - jitter_count))
+    random.shuffle(schedule)
+    return schedule
+
+
+def build_zone_plan(
+    valid_centers: list[tuple[int, int]],
+    zone_count: int,
+) -> tuple[
+    list[tuple[tuple[int, int], tuple[int, int, int]]],
+    list[tuple[tuple[int, int], tuple[int, int, int]]],
+]:
+    """优先留存黄色位置覆盖，并返回可参与数据集切分的剩余圈计划。"""
+    yellow_count = round(zone_count * CONFIG["UI_ZONE_YELLOW_PROB"])
+    blue_count = zone_count - yellow_count
+    yellow_plan = [
+        (center, ZONE_YELLOW_BGR)
+        for center in build_balanced_schedule(valid_centers, yellow_count)
+    ]
+    coverage_count = min(len(valid_centers), len(yellow_plan))
+    train_only_plan = yellow_plan[:coverage_count]
+    split_plan = yellow_plan[coverage_count:]
+    split_plan.extend(
+        (center, ZONE_BLUE_BGR)
+        for center in build_balanced_schedule(valid_centers, blue_count)
+    )
+    random.shuffle(train_only_plan)
+    random.shuffle(split_plan)
+    return train_only_plan, split_plan
+
+
+def load_error_images(
+    class_name: str,
+    error_dir: Path,
+    generated_count: int,
+) -> tuple[list, list]:
+    """加载指定类别的困难样本，并生成稳定且有实际权重的训练样本。"""
+    source_images = []
     error_path = error_dir / class_name
 
     for ext in ("*.[pP][nN][gG]", "*.[jJ][pP][gG]"):
-        for file_path in error_path.glob(ext):
-            img = safe_imread(file_path)
-            if img is None:
-                continue
+        for file_path in sorted(error_path.glob(ext)):
+            source_images.append(load_curated_sample(file_path))
 
-            if img.shape[:2] != (CONFIG["OUTPUT_SIZE"], CONFIG["OUTPUT_SIZE"]):
-                img = cv2.resize(img, (CONFIG["OUTPUT_SIZE"], CONFIG["OUTPUT_SIZE"]))
+    sample_count = max(
+        len(source_images) * CONFIG["ERROR_OVERSAMPLE"],
+        round(generated_count * CONFIG["ERROR_MIN_RATIO"]),
+    )
+    return [
+        apply_random_occlusion(img.copy())
+        for img in build_balanced_schedule(source_images, sample_count)
+    ]
 
-            for _ in range(CONFIG["ERROR_OVERSAMPLE"]):
-                aug = img.copy()
-                aug = apply_random_occlusion(aug)
-                error_samples.append(aug)
 
-    return error_samples
+def add_error_training_samples(error_dir: Path | None, output_dir: Path) -> int:
+    """将困难样本按类别一次性写入 train，避免跨源图重复和验证集泄漏。"""
+    if error_dir is None or not error_dir.exists():
+        return 0
+
+    total = 0
+    class_dirs = sorted(
+        path
+        for path in error_dir.iterdir()
+        if path.is_dir() and not path.name.startswith((".", "_"))
+    )
+    for class_dir in class_dirs:
+        train_dir = output_dir / "train" / class_dir.name
+        val_dir = output_dir / "val" / class_dir.name
+        if not train_dir.exists() or not val_dir.exists():
+            logger.warning(
+                f"Skipping hard samples for unknown generated class: {class_dir.name}"
+            )
+            continue
+
+        generated_count = sum(
+            1
+            for split_dir in (train_dir, val_dir)
+            for path in split_dir.iterdir()
+            if path.suffix.lower() in {".png", ".jpg", ".jpeg"}
+        )
+        error_samples = load_error_images(
+            class_dir.name,
+            error_dir,
+            generated_count,
+        )
+        for index, img in enumerate(error_samples):
+            safe_imwrite(train_dir / f"hard_{index:05d}.jpg", img)
+
+        total += len(error_samples)
+        if error_samples:
+            logger.info(
+                f"Added {len(error_samples)} train-only hard samples for {class_dir.name}."
+            )
+
+    return total
 
 
 def generate_samples(
@@ -887,7 +1357,8 @@ def generate_samples(
     target_count: int | None = None,
     light_aug: bool = False,
     random_sampling_only: bool = False,
-) -> list:
+    tier_context: dict | None = None,
+) -> tuple[list, list]:
     """生成 TARGET_COUNT 个基础样本，并为地图类追加区域圈干扰样本。
 
     sample_region:
@@ -910,6 +1381,27 @@ def generate_samples(
 
     region_x2 = region_x + region_w
     region_y2 = region_y + region_h
+    tier_center_mask = (
+        build_tier_center_mask(
+            img[pad : pad + orig_h, pad : pad + orig_w],
+            tier_context["mask_mode"] if tier_context is not None else "opaque",
+        )
+        if light_aug
+        else None
+    )
+    background_profile = (
+        BackgroundProfile.TIER if light_aug else BackgroundProfile.STANDARD
+    )
+    min_map_circle_coverage = (
+        CONFIG["TIER_MIN_MAP_CIRCLE_COVERAGE"]
+        if light_aug
+        else CONFIG["MIN_MAP_CIRCLE_COVERAGE"]
+    )
+    min_alpha_circle_coverage = (
+        CONFIG["TIER_MIN_ALPHA_CIRCLE_COVERAGE"]
+        if light_aug
+        else CONFIG["MIN_ALPHA_CIRCLE_COVERAGE"]
+    )
 
     valid_centers = []
     if random_sampling_only:
@@ -926,78 +1418,189 @@ def generate_samples(
                 continue
             seen_centers.add((cx, cy))
 
-            if is_valid(extract_roi(img, cx, cy, 0, safe_size)):
+            if is_valid(
+                extract_roi(img, cx, cy, 0, safe_size),
+                min_map_circle_coverage=min_map_circle_coverage,
+                min_alpha_circle_coverage=min_alpha_circle_coverage,
+            ):
                 valid_centers.append((cx, cy))
                 if len(valid_centers) >= target_count:
                     break
     else:
         for y in range(region_y, region_y2, CONFIG["STRIDE"]):
             for x in range(region_x, region_x2, CONFIG["STRIDE"]):
+                if tier_center_mask is not None and not tier_center_mask[y, x]:
+                    continue
                 cx, cy = x + pad, y + pad
-                if is_valid(extract_roi(img, cx, cy, 0, safe_size)):
+                if is_valid(
+                    extract_roi(img, cx, cy, 0, safe_size),
+                    min_map_circle_coverage=min_map_circle_coverage,
+                    min_alpha_circle_coverage=min_alpha_circle_coverage,
+                ):
                     valid_centers.append((cx, cy))
 
     if not valid_centers:
-        return []
+        return [], []
 
     if sample_region is not None and len(valid_centers) < CONFIG["MIN_VALID_CENTERS_PER_TILE"]:
-        return []
+        return [], []
 
     samples = []
-    for cx, cy in valid_centers:
-        if len(samples) >= target_count:
-            break
-        samples.append(process_patch(img, cx, cy, 0, safe_size, bg_paths, light_aug))
+    train_only_samples = []
+    center_schedule = build_balanced_schedule(valid_centers, target_count)
+    ui_clutter_schedule = build_ui_clutter_schedule(len(center_schedule))
+    scale_schedule = (
+        [1.0] * len(center_schedule)
+        if random_sampling_only
+        else build_scale_jitter_schedule(len(center_schedule))
+    )
+    min_cx, max_cx = region_x + pad, region_x2 - 1 + pad
+    min_cy, max_cy = region_y + pad, region_y2 - 1 + pad
 
-    while len(samples) < target_count:
-        cx, cy = random.choice(valid_centers)
-        nx = max(pad, min(cx + random.randint(-5, 5), w - pad))
-        ny = max(pad, min(cy + random.randint(-5, 5), h - pad))
-        angle = random.uniform(-CONFIG["ANGLE_JITTER"], CONFIG["ANGLE_JITTER"])
+    for index, ((cx, cy), ui_clutter, scale) in enumerate(
+        zip(center_schedule, ui_clutter_schedule, scale_schedule)
+    ):
+        nx, ny, angle = cx, cy, 0.0
+        if index >= len(valid_centers):
+            # Tile 标签由中心点决定，随机位移不能跨入相邻 tile。
+            nx = min(max(cx + random.randint(-5, 5), min_cx), max_cx)
+            ny = min(max(cy + random.randint(-5, 5), min_cy), max_cy)
+            angle = random.uniform(-CONFIG["ANGLE_JITTER"], CONFIG["ANGLE_JITTER"])
+            if tier_center_mask is not None and not tier_center_mask[ny - pad, nx - pad]:
+                nx, ny = cx, cy
 
-        patch = extract_roi(img, nx, ny, angle, safe_size)
-        if is_valid(patch):
-            patch_bgr = apply_background_composition(patch, bg_paths)
-            if light_aug:
-                samples.append(augment_patch_light(patch_bgr))
-            else:
-                samples.append(augment_patch(patch_bgr, safe_size))
+        patch = extract_roi(img, nx, ny, angle, safe_size, scale)
+        if not is_valid(
+            patch,
+            min_map_circle_coverage=min_map_circle_coverage,
+            min_alpha_circle_coverage=min_alpha_circle_coverage,
+        ):
+            nx, ny, angle = cx, cy, 0.0
+            patch = extract_roi(img, cx, cy, 0, safe_size)
+            scale = 1.0
+
+        if tier_context is None:
+            patch_bgr = apply_background_composition(
+                patch,
+                bg_paths,
+                background_profile,
+            )
+        else:
+            parent_patch = extract_roi(
+                tier_context["parent_aligned"],
+                nx,
+                ny,
+                angle,
+                safe_size,
+                scale,
+            )
+            patch_bgr = compose_tier_context_patch(patch, parent_patch)
+        if light_aug:
+            sample = augment_patch_light(patch_bgr, ui_clutter)
+        else:
+            sample = augment_patch(patch_bgr, safe_size, ui_clutter)
+
+        if not random_sampling_only:
+            sample = finalize_positive_map_sample(sample)
+
+        train_only = ui_clutter != UiClutter.NONE or scale != 1.0 or (
+            sample_region is not None and index < len(valid_centers)
+        )
+        target = train_only_samples if train_only else samples
+        target.append(sample)
 
     if random_sampling_only:
-        return samples
+        return samples, train_only_samples
 
     zone_count = round(target_count * CONFIG["UI_ZONE_EXTRA_RATIO"])
-    zone_samples = []
-    for _ in range(zone_count):
-        cx, cy = random.choice(valid_centers)
-        patch_bgr = compose_patch(img, cx, cy, 0, safe_size, bg_paths)
-        zone_samples.append(augment_zone_patch(patch_bgr))
-    samples.extend(zone_samples)
-    return samples
+    train_zone_plan, split_zone_plan = build_zone_plan(valid_centers, zone_count)
+    if sample_region is None:
+        split_zone_plan.extend(train_zone_plan)
+        random.shuffle(split_zone_plan)
+        train_zone_plan = []
+
+    train_zone_ui_clutter = build_zone_ui_clutter_schedule(train_zone_plan)
+    split_zone_ui_clutter = build_zone_ui_clutter_schedule(split_zone_plan)
+    train_zone_scales = build_scale_jitter_schedule(len(train_zone_plan))
+    split_zone_scales = build_scale_jitter_schedule(len(split_zone_plan))
+    for ((cx, cy), fill_color), ui_clutter, scale in zip(
+        train_zone_plan,
+        train_zone_ui_clutter,
+        train_zone_scales,
+    ):
+        patch_bgr = compose_patch(
+            img,
+            cx,
+            cy,
+            0,
+            safe_size,
+            bg_paths,
+            scale,
+            background_profile=background_profile,
+            tier_context=tier_context,
+        )
+        sample = augment_zone_patch(patch_bgr, fill_color, ui_clutter)
+        train_only_samples.append(finalize_positive_map_sample(sample))
+    for ((cx, cy), fill_color), ui_clutter, scale in zip(
+        split_zone_plan,
+        split_zone_ui_clutter,
+        split_zone_scales,
+    ):
+        patch_bgr = compose_patch(
+            img,
+            cx,
+            cy,
+            0,
+            safe_size,
+            bg_paths,
+            scale,
+            background_profile=background_profile,
+            tier_context=tier_context,
+        )
+        sample = augment_zone_patch(patch_bgr, fill_color, ui_clutter)
+        train_only = ui_clutter != UiClutter.NONE or scale != 1.0
+        target = train_only_samples if train_only else samples
+        target.append(finalize_positive_map_sample(sample))
+    return samples, train_only_samples
 
 
-def save_dataset(samples: list, class_name: str, file_stem: str, output_dir: Path) -> None:
+def save_dataset(
+    samples: list,
+    class_name: str,
+    file_stem: str,
+    output_dir: Path,
+    train_only_samples: list | None = None,
+) -> None:
     """将样本列表按 VAL_RATIO 随机划分并写入 train/val 目录。
+
+    train_only_samples 用于保留每个位置的普通/黄圈监督，不参与随机验证集。
 
     保证：
     - 只要该类有样本，train 至少 1 张
     - 只要该类有样本，val 至少 1 张
     这样不会出现 train/val 类集合不一致。
     """
-    if not samples:
+    train_only_samples = train_only_samples or []
+    if not samples and not train_only_samples:
         return
 
     random.shuffle(samples)
-    n = len(samples)
+    total = len(samples) + len(train_only_samples)
 
-    if n == 1:
-        train_samples = [samples[0]]
-        val_samples = [samples[0].copy()]
+    if total == 1:
+        sample = (samples or train_only_samples)[0]
+        train_samples = [sample]
+        val_samples = [sample.copy()]
+    elif not samples:
+        train_samples = train_only_samples
+        val_samples = [random.choice(train_only_samples).copy()]
     else:
-        split_idx = int(n * CONFIG["VAL_RATIO"])
-        split_idx = max(1, min(split_idx, n - 1))
-        val_samples = samples[:split_idx]
-        train_samples = samples[split_idx:]
+        val_count = max(1, min(int(total * CONFIG["VAL_RATIO"]), len(samples)))
+        if not train_only_samples:
+            val_count = min(val_count, len(samples) - 1)
+        val_samples = samples[:val_count]
+        train_samples = samples[val_count:] + train_only_samples
+        random.shuffle(train_samples)
 
     train_class_dir = output_dir / "train" / class_name
     val_class_dir = output_dir / "val" / class_name
@@ -1012,7 +1615,7 @@ def save_dataset(samples: list, class_name: str, file_stem: str, output_dir: Pat
 
 
 def copy_fixed_validation_samples(fixed_val_dir: Path, output_dir: Path) -> int:
-    """将人工确认的预处理样本原样加入验证集。"""
+    """校验并将人工确认的预处理样本原样加入验证集。"""
     if not fixed_val_dir.exists():
         return 0
 
@@ -1024,8 +1627,14 @@ def copy_fixed_validation_samples(fixed_val_dir: Path, output_dir: Path) -> int:
     )
     for class_dir in class_dirs:
         target_dir = output_dir / "val" / class_dir.name
+        if not (output_dir / "train" / class_dir.name).exists():
+            raise ValueError(
+                f"Fixed validation class was not generated: {class_dir.name}"
+            )
+
         for pattern in ("*.[pP][nN][gG]", "*.[jJ][pP][gG]"):
             for source_path in sorted(class_dir.glob(pattern)):
+                load_curated_sample(source_path)
                 target_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_path, target_dir / f"fixed_{source_path.name}")
                 copied += 1
@@ -1041,9 +1650,9 @@ def process_image_task(
     file_path: Path,
     class_name: str,
     output_dir: Path,
-    error_dir: Path,
     bg_paths: list,
     target_count_override: int | None = None,
+    tier_spec: dict | None = None,
 ):
     """单张源图处理入口，供 ProcessPoolExecutor 调度。"""
     safe_size = get_safe_size()
@@ -1054,6 +1663,18 @@ def process_image_task(
             "message": f"Failed to load {file_path}",
             "tile_mapping": {},
         }
+
+    is_tier = "Tier" in class_name
+    tier_context = None
+    if is_tier:
+        if tier_spec is None:
+            raise ValueError(f"Missing map_export.json entry for Tier class: {class_name}")
+        if Path(tier_spec["template_path"]).resolve() != file_path.resolve():
+            raise ValueError(
+                f"Tier manifest template does not match task: {class_name} -> "
+                f"{tier_spec['template_path']} (task={file_path})"
+            )
+        tier_context = build_tier_parent_context(img, tier_spec, safe_size)
 
     pad = safe_size // 2
     h, w = img.shape[:2]
@@ -1067,12 +1688,12 @@ def process_image_task(
         for tile in tiles:
             tile_class = tile["class_name"]
             region = (tile["x"], tile["y"], tile["w"], tile["h"])
-            samples = generate_samples(img, safe_size, bg_paths, sample_region=region)
-
-            if error_dir and (error_dir / tile_class).exists():
-                error_samples = load_error_images(tile_class, error_dir)
-                if error_samples:
-                    samples.extend(error_samples)
+            samples, train_only_samples = generate_samples(
+                img,
+                safe_size,
+                bg_paths,
+                sample_region=region,
+            )
 
             tile_mapping[tile_class] = {
                 "base_class": tile["base_class"],
@@ -1085,10 +1706,16 @@ def process_image_task(
                 "infer_margin": CONFIG["TILE_INFER_MARGIN"],
             }
 
-            if not samples:
+            if not samples and not train_only_samples:
                 continue
 
-            save_dataset(samples, tile_class, tile_class, output_dir)
+            save_dataset(
+                samples,
+                tile_class,
+                tile_class,
+                output_dir,
+                train_only_samples,
+            )
             processed_count += 1
 
         return {
@@ -1097,28 +1724,28 @@ def process_image_task(
         }
 
     is_none = class_name == "None"
-    is_tier = "Tier" in class_name
     target_count = (
         target_count_override
         if target_count_override is not None
         else (CONFIG["TIER_TARGET_COUNT"] if is_tier else CONFIG["TARGET_COUNT"])
     )
-    samples = generate_samples(
+    samples, train_only_samples = generate_samples(
         img,
         safe_size,
         bg_paths,
         target_count=target_count,
         light_aug=is_tier,
         random_sampling_only=is_none,
+        tier_context=tier_context,
     )
 
-    # 允许所有类（包含 None）读取对应的 error_images
-    if error_dir and (error_dir / class_name).exists():
-        error_samples = load_error_images(class_name, error_dir)
-        if error_samples:
-            samples.extend(error_samples)
-
-    save_dataset(samples, class_name, file_path.stem, output_dir)
+    save_dataset(
+        samples,
+        class_name,
+        file_path.stem,
+        output_dir,
+        train_only_samples,
+    )
     return {
         "message": f"Completed {class_name} ({file_path.name})",
         "tile_mapping": {},
@@ -1141,12 +1768,20 @@ class DataPreprocessor:
         bg_dir: str,
         fixed_val_dir: str,
         max_workers: int | None = None,
+        map_export_path: str = DEFAULT_OPTIONS["map_export"],
     ):
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
         self.error_dir = Path(error_dir) if error_dir else None
         self.fixed_val_dir = Path(fixed_val_dir)
         self.max_workers = max_workers
+        self.map_export_path = Path(map_export_path)
+        self.tier_specs = None
+        if self.map_export_path.exists():
+            self.tier_specs = load_map_export_manifest(
+                self.map_export_path,
+                self.input_dir,
+            )
 
         self.bg_paths: list[Path] = []
         bg_dir_path = Path(bg_dir) if bg_dir else None
@@ -1200,12 +1835,34 @@ class DataPreprocessor:
                 if target_count > 0:
                     tasks.append((file_path, "None", target_count))
 
+        tier_classes = {
+            class_name
+            for _file_path, class_name, _target_count in tasks
+            if "Tier" in class_name
+        }
+        if tier_classes:
+            if self.tier_specs is None:
+                raise FileNotFoundError(
+                    f"Tier classes require the complete export manifest: {self.map_export_path}"
+                )
+            manifest_classes = set(self.tier_specs)
+            missing = sorted(tier_classes - manifest_classes)
+            extra = sorted(manifest_classes - tier_classes)
+            if missing or extra:
+                details = []
+                if missing:
+                    details.append(f"missing entries: {', '.join(missing)}")
+                if extra:
+                    details.append(f"stale entries: {', '.join(extra)}")
+                raise ValueError("map_export.json does not match source_images (" + "; ".join(details) + ")")
+
         max_workers = self.max_workers or os.cpu_count() or 4
         logger.info(
             f"Starting parallel processing with {max_workers} workers for {len(tasks)} tasks..."
         )
 
         merged_tile_mapping = {}
+        failed_tasks = []
 
         with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
             future_to_file = {
@@ -1214,9 +1871,9 @@ class DataPreprocessor:
                     file_path,
                     class_name,
                     self.output_dir,
-                    self.error_dir,
                     self.bg_paths,
                     target_count_override,
+                    self.tier_specs.get(class_name) if self.tier_specs else None,
                 ): file_path
                 for file_path, class_name, target_count_override in tasks
             }
@@ -1230,10 +1887,23 @@ class DataPreprocessor:
                         merged_tile_mapping.update(result["tile_mapping"])
                 except Exception as e:
                     logger.error(f"Error processing {file_path}: {e}")
+                    failed_tasks.append((file_path, e))
+
+        if failed_tasks:
+            summary = "; ".join(f"{path}: {error}" for path, error in failed_tasks[:5])
+            if len(failed_tasks) > 5:
+                summary += f"; ... and {len(failed_tasks) - 5} more"
+            raise RuntimeError(f"Preprocessing failed for {len(failed_tasks)} task(s): {summary}")
 
         if merged_tile_mapping:
             save_tile_mapping(merged_tile_mapping, self.output_dir)
             logger.info(f"Saved tile mapping with {len(merged_tile_mapping)} entries.")
+
+        hard_sample_count = add_error_training_samples(
+            self.error_dir,
+            self.output_dir,
+        )
+        logger.info(f"Added {hard_sample_count} train-only hard samples in total.")
 
         fixed_val_count = copy_fixed_validation_samples(
             self.fixed_val_dir,
@@ -1276,6 +1946,12 @@ def parse_args() -> argparse.Namespace:
         dest="fixed_val",
         default=argparse.SUPPRESS,
         help=f"Directory containing fixed validation samples (default: {DEFAULT_OPTIONS['fixed_val']})",
+    )
+    parser.add_argument(
+        "--map-export",
+        dest="map_export",
+        default=argparse.SUPPRESS,
+        help=f"Portable Tier export manifest (default: {DEFAULT_OPTIONS['map_export']})",
     )
     parser.add_argument(
         "--workers",
@@ -1363,4 +2039,5 @@ if __name__ == "__main__":
         args.bg,
         args.fixed_val,
         args.workers,
+        args.map_export,
     ).run()
