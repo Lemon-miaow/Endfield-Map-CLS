@@ -70,7 +70,11 @@ CONFIG = {
     "TILE_STRIDE": 160,
     "TILE_INFER_MARGIN": 64,
     "UI_ICON_SCALE": 0.08,
-    "UI_BLUE_PROB": 0.5,
+    "UI_ICON_SCALE_JITTER": 0.10,
+    "UI_ICON_MIN_SIDE": 8,
+    "UI_ICON_OUTLINE": 1,
+    "UI_BLUE_PROB": 0.30,
+    "UI_LANDMARK_PROB": 0.40,
     "UI_ICON_MIN_COUNT": 2,
     "UI_ICON_MAX_COUNT": 6,
     "UI_ZONE_EXTRA_RATIO": 0.50,
@@ -302,6 +306,7 @@ def load_curated_sample(path: Path) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 _ui_icon_cache = None
+UI_BLUE_BGR = (255, 209, 25)
 
 
 def load_ui_icons(icon_dir: str) -> dict:
@@ -318,27 +323,15 @@ def load_ui_icons(icon_dir: str) -> dict:
             continue
         raw_icons[file_path.name] = img
 
-    processed = {"normal": {}, "pointer": None}
+    processed = {"normal": {}, "landmarks": [], "pointer": None}
 
     for name, img in raw_icons.items():
         if name.lower() == "pointer.png":
             processed["pointer"] = sanitize_rgba_alpha(img, alpha_floor=8)
+        elif name.lower().startswith("landmark_"):
+            processed["landmarks"].append(sanitize_rgba_alpha(img, alpha_floor=8))
         else:
-            sanitized = sanitize_rgba_alpha(img, alpha_floor=8)
-
-            white_outlined = add_black_outline_rgba(
-                sanitized,
-                thickness=2,
-                alpha_threshold=32,
-            )
-            blue_tinted = tint_icon_blue_rgba(sanitized, (248, 205, 97))
-            blue_outlined = add_black_outline_rgba(
-                blue_tinted,
-                thickness=2,
-                alpha_threshold=32,
-            )
-
-            processed["normal"][name] = {"white": white_outlined, "blue": blue_outlined}
+            processed["normal"][name] = sanitize_rgba_alpha(img, alpha_floor=8)
 
     logger.info(f"Loaded and pre-processed UI icons: {sorted(raw_icons.keys())}")
     if processed["pointer"] is None:
@@ -394,12 +387,13 @@ def add_black_outline_rgba(
     return result
 
 
-def tint_icon_blue_rgba(icon_rgba: np.ndarray, bgr_color=(248, 205, 97)) -> np.ndarray:
+def tint_icon_blue_rgba(icon_rgba: np.ndarray, bgr_color=UI_BLUE_BGR) -> np.ndarray:
+    """按原图明度着色，保留真实图标内部的黑色结构。"""
     result = icon_rgba.copy()
-    alpha = result[..., 3] > 0
-    result[alpha, 0] = bgr_color[0]
-    result[alpha, 1] = bgr_color[1]
-    result[alpha, 2] = bgr_color[2]
+    luminance = cv2.cvtColor(result[..., :3], cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    color = np.asarray(bgr_color, dtype=np.float32)
+    result[..., :3] = np.clip(luminance[..., None] * color, 0, 255).astype(np.uint8)
+    result[result[..., 3] == 0, :3] = 0
     return result
 
 
@@ -413,7 +407,21 @@ def resize_rgba(icon_rgba: np.ndarray, scale: float, min_side: int | None = None
         new_w = int(round(new_w * factor))
         new_h = int(round(new_h * factor))
 
-    return cv2.resize(icon_rgba, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    interpolation = cv2.INTER_AREA if scale <= 1.0 else cv2.INTER_LINEAR
+    alpha = icon_rgba[..., 3].astype(np.float32) / 255.0
+    premultiplied = icon_rgba[..., :3].astype(np.float32) * alpha[..., None]
+    resized_alpha = cv2.resize(alpha, (new_w, new_h), interpolation=interpolation)
+    resized_rgb = cv2.resize(premultiplied, (new_w, new_h), interpolation=interpolation)
+
+    result = np.zeros((new_h, new_w, 4), dtype=np.uint8)
+    visible = resized_alpha > 1e-6
+    result[visible, :3] = np.clip(
+        resized_rgb[visible] / resized_alpha[visible, None],
+        0,
+        255,
+    ).astype(np.uint8)
+    result[..., 3] = np.clip(resized_alpha * 255, 0, 255).astype(np.uint8)
+    return result
 
 
 def overlay_rgba_on_bgr(dst_bgr: np.ndarray, icon_rgba: np.ndarray, x: int, y: int) -> np.ndarray:
@@ -448,45 +456,51 @@ def _sample_normal_ui_icon(normal_icons: dict, icon_names: list[str], name: str 
     if name is None:
         name = random.choice(icon_names)
 
-    variants = normal_icons[name]
-    mode = "blue" if random.random() < CONFIG["UI_BLUE_PROB"] else "white"
-    return resize_rgba(variants[mode], CONFIG["UI_ICON_SCALE"])
+    jitter = CONFIG["UI_ICON_SCALE_JITTER"]
+    scale = CONFIG["UI_ICON_SCALE"] * random.uniform(1.0 - jitter, 1.0 + jitter)
+    icon = resize_rgba(
+        normal_icons[name],
+        scale,
+        min_side=CONFIG["UI_ICON_MIN_SIDE"],
+    )
+    if random.random() < CONFIG["UI_BLUE_PROB"]:
+        icon = tint_icon_blue_rgba(icon)
+
+    outline = CONFIG["UI_ICON_OUTLINE"]
+    icon = cv2.copyMakeBorder(
+        icon,
+        outline,
+        outline,
+        outline,
+        outline,
+        cv2.BORDER_CONSTANT,
+        value=(0, 0, 0, 0),
+    )
+    return add_black_outline_rgba(icon, thickness=outline, alpha_threshold=24)
 
 
 def draw_one_normal_icon(result: np.ndarray, icon_rgba: np.ndarray, x: int, y: int) -> np.ndarray:
     return overlay_rgba_on_bgr(result, icon_rgba, x, y)
 
 
+def sample_minimap_center(h: int, w: int, edge_bias: bool = False) -> tuple[int, int]:
+    """在真实小地图圆内采样图标中心，少量覆盖圆周裁切场景。"""
+    max_radius = min(CONFIG["MASK_DIAMETER"] / 2 - 3, h / 2 - 3, w / 2 - 3)
+    if edge_bias:
+        radius = random.uniform(max_radius * 0.72, max_radius)
+    else:
+        radius = math.sqrt(random.random()) * max_radius
+    angle = random.uniform(0, math.tau)
+    return (
+        round(w / 2 + math.cos(angle) * radius),
+        round(h / 2 + math.sin(angle) * radius),
+    )
+
+
 def sample_extreme_anchor(h: int, w: int) -> tuple[int, int]:
-    """采样极端 UI 干扰的锚点，优先覆盖边缘高风险区域。"""
-    if random.random() < CONFIG["EXTREME_UI_EDGE_BIAS_PROB"]:
-        if random.random() < 0.6:
-            x_low = max(20, int(w * 0.55))
-            x_high = max(x_low, w - 20)
-            y_low = 20
-            y_high = max(y_low, int(h * 0.42))
-            return random.randint(x_low, x_high), random.randint(y_low, y_high)
-
-        side = random.choice(["top", "bottom", "left", "right"])
-        if side == "top":
-            x_low, x_high = 20, max(20, w - 20)
-            y_low, y_high = 20, max(20, min(38, h - 20))
-            return random.randint(x_low, x_high), random.randint(y_low, y_high)
-        if side == "bottom":
-            x_low, x_high = 20, max(20, w - 20)
-            y_low, y_high = max(20, h - 38), max(max(20, h - 38), h - 20)
-            return random.randint(x_low, x_high), random.randint(y_low, y_high)
-        if side == "left":
-            x_low, x_high = 20, max(20, min(38, w - 20))
-            y_low, y_high = 20, max(20, h - 20)
-            return random.randint(x_low, x_high), random.randint(y_low, y_high)
-        x_low, x_high = max(20, w - 38), max(max(20, w - 38), w - 20)
-        y_low, y_high = 20, max(20, h - 20)
-        return random.randint(x_low, x_high), random.randint(y_low, y_high)
-
-    x_low, x_high = 24, max(24, w - 24)
-    y_low, y_high = 24, max(24, h - 24)
-    return random.randint(x_low, x_high), random.randint(y_low, y_high)
+    """采样极端 UI 干扰的锚点，同时覆盖中心簇与圆周簇。"""
+    edge_bias = random.random() < CONFIG["EXTREME_UI_EDGE_BIAS_PROB"]
+    return sample_minimap_center(h, w, edge_bias=edge_bias)
 
 
 def add_extreme_icon_clutter(
@@ -507,33 +521,35 @@ def add_extreme_icon_clutter(
         CONFIG[f"{prefix}_PACK_MIN"],
         CONFIG[f"{prefix}_PACK_MAX"],
     )
-    chain_names = [name for name in icon_names if "common" in name.lower()]
+    total_icon_count = random.randint(
+        CONFIG[f"{prefix}_ICONS_MIN"],
+        CONFIG[f"{prefix}_ICONS_MAX"],
+    )
+    icons_per_pack = [total_icon_count // pack_count] * pack_count
+    for index in range(total_icon_count % pack_count):
+        icons_per_pack[index] += 1
+    random.shuffle(icons_per_pack)
 
-    for _ in range(pack_count):
+    for icon_count in icons_per_pack:
         cx, cy = sample_extreme_anchor(h, w)
         radius = random.randint(
             CONFIG[f"{prefix}_RADIUS_MIN"],
             CONFIG[f"{prefix}_RADIUS_MAX"],
         )
-        icon_count = random.randint(
-            CONFIG[f"{prefix}_ICONS_MIN"],
-            CONFIG[f"{prefix}_ICONS_MAX"],
-        )
-
         if random.random() < CONFIG[f"{prefix}_CHAIN_PROB"]:
             angle = random.uniform(0, 2 * np.pi)
-            step = random.randint(4, 8)
-            chain_name = random.choice(chain_names) if ultra and chain_names else None
+            step = random.randint(6, 9)
 
             for i in range(icon_count):
                 t = (i - (icon_count - 1) / 2.0) * step
-                dx = int(round(np.cos(angle) * t + random.gauss(0, 2.0)))
-                dy = int(round(np.sin(angle) * t + random.gauss(0, 2.0)))
+                normal_offset = random.gauss(0, 2.0)
+                dx = int(round(np.cos(angle) * t - np.sin(angle) * normal_offset))
+                dy = int(round(np.sin(angle) * t + np.cos(angle) * normal_offset))
 
-                icon = _sample_normal_ui_icon(normal_icons, icon_names, chain_name)
+                icon = _sample_normal_ui_icon(normal_icons, icon_names)
                 ih, iw = icon.shape[:2]
-                x = min(max(cx + dx - iw // 2, 0), max(0, w - iw))
-                y = min(max(cy + dy - ih // 2, 0), max(0, h - ih))
+                x = cx + dx - iw // 2
+                y = cy + dy - ih // 2
 
                 out = draw_one_normal_icon(out, icon, x, y)
         else:
@@ -543,8 +559,8 @@ def add_extreme_icon_clutter(
 
                 icon = _sample_normal_ui_icon(normal_icons, icon_names)
                 ih, iw = icon.shape[:2]
-                x = min(max(cx + dx - iw // 2, 0), max(0, w - iw))
-                y = min(max(cy + dy - ih // 2, 0), max(0, h - ih))
+                x = cx + dx - iw // 2
+                y = cy + dy - ih // 2
 
                 out = draw_one_normal_icon(out, icon, x, y)
 
@@ -639,8 +655,9 @@ def add_random_map_icons(
             icon = _sample_normal_ui_icon(normal_icons, icon_names)
 
             ih, iw = icon.shape[:2]
-            x = random.randint(0, max(0, w - iw))
-            y = random.randint(0, max(0, h - ih))
+            cx, cy = sample_minimap_center(h, w)
+            x = cx - iw // 2
+            y = cy - ih // 2
 
             result = draw_one_normal_icon(result, icon, x, y)
 
@@ -651,6 +668,13 @@ def add_random_map_icons(
                 icon_names,
                 ui_clutter,
             )
+
+    landmarks = ui_icons["landmarks"]
+    if landmarks and random.random() < CONFIG["UI_LANDMARK_PROB"]:
+        landmark = resize_rgba(random.choice(landmarks), random.uniform(0.9, 1.1))
+        ih, iw = landmark.shape[:2]
+        cx, cy = sample_minimap_center(h, w, edge_bias=random.random() < 0.5)
+        result = overlay_rgba_on_bgr(result, landmark, cx - iw // 2, cy - ih // 2)
 
     return result
 
