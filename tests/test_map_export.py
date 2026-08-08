@@ -69,6 +69,7 @@ class MapExportContractTests(unittest.TestCase):
 
             template_path = root / "Map02Lv002Tier255.png"
             template = np.zeros((32, 32, 4), dtype=np.uint8)
+            template[..., 3] = 255
             template[12:20, 12:20] = (255, 255, 255, 255)
             safe_imwrite(template_path, template)
             spec = {

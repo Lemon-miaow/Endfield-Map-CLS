@@ -844,12 +844,38 @@ def build_tier_parent_context(
 def compose_tier_context_patch(
     tier_patch_bgra: np.ndarray,
     parent_patch_bgr: np.ndarray,
+    mask_mode: str = "opaque",
 ) -> np.ndarray:
     """Overlay the Tier foreground on the complete parent-map context."""
     tier_bgr = premultiply_to_bgr(tier_patch_bgra).astype(np.float32)
     alpha = tier_patch_bgra[..., 3].astype(np.float32) / 255.0
+    gray = cv2.cvtColor(tier_bgr.astype(np.uint8), cv2.COLOR_BGR2GRAY)
+    if mask_mode == "bright":
+        foreground = (alpha > 10 / 255.0) & (gray > 18)
+    else:
+        opaque = alpha > 10 / 255.0
+        dark = (opaque & (gray <= 12)).astype(np.uint8)
+        _, labels = cv2.connectedComponents(dark, 8)
+        ys, xs = np.nonzero(opaque)
+        min_y, max_y = ys.min(), ys.max()
+        min_x, max_x = xs.min(), xs.max()
+        border_labels = np.unique(
+            np.concatenate(
+                (
+                    labels[min_y, min_x : max_x + 1],
+                    labels[max_y, min_x : max_x + 1],
+                    labels[min_y : max_y + 1, min_x],
+                    labels[min_y : max_y + 1, max_x],
+                )
+            )
+        )
+        border_dark = np.isin(labels, border_labels) & (labels > 0)
+        foreground = (alpha > 10 / 255.0) & ~border_dark
+    foreground_alpha = alpha * foreground.astype(np.float32)
     parent = parent_patch_bgr.astype(np.float32)
-    result = tier_bgr * alpha[..., None] + parent * (1.0 - alpha[..., None])
+    result = tier_bgr * foreground_alpha[..., None] + parent * (
+        1.0 - foreground_alpha[..., None]
+    )
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
@@ -1160,7 +1186,11 @@ def compose_patch(
             safe_size,
             scale,
         )
-        return compose_tier_context_patch(patch_bgra, parent_patch)
+        return compose_tier_context_patch(
+            patch_bgra,
+            parent_patch,
+            tier_context["mask_mode"],
+        )
     return apply_background_composition(patch_bgra, bg_paths, background_profile)
 
 
@@ -1484,7 +1514,11 @@ def generate_samples(
                 safe_size,
                 scale,
             )
-            patch_bgr = compose_tier_context_patch(patch, parent_patch)
+            patch_bgr = compose_tier_context_patch(
+                patch,
+                parent_patch,
+                tier_context["mask_mode"],
+            )
         if light_aug:
             sample = augment_patch_light(patch_bgr, ui_clutter)
         else:
