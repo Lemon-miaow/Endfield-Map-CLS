@@ -88,6 +88,10 @@ class MapExportContractTests(unittest.TestCase):
 
             self.assertGreater(int(output[center + 8, center + 8].sum()), 0)
             self.assertGreater(int(output[center + 16, center + 16].sum()), 0)
+            np.testing.assert_array_equal(
+                output[center + 20, center + 20],
+                context["parent_aligned"][center + 20, center + 20],
+            )
 
 
 if __name__ == "__main__":

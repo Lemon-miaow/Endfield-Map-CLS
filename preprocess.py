@@ -103,8 +103,6 @@ CONFIG = {
     "MIN_ALPHA_CIRCLE_COVERAGE": 0.12,
     "TIER_MIN_MAP_CIRCLE_COVERAGE": 0.02,
     "TIER_MIN_ALPHA_CIRCLE_COVERAGE": 0.08,
-    "TIER_CONTEXT_RING_RADIUS": 42,
-    "TIER_CONTEXT_RING_ALPHA": 0.25,
     "MIN_VALID_STD": 8.0,
     "MIN_VALID_CENTERS_PER_TILE": 24,
 }
@@ -847,20 +845,11 @@ def compose_tier_context_patch(
     tier_patch_bgra: np.ndarray,
     parent_patch_bgr: np.ndarray,
 ) -> np.ndarray:
-    """Keep the Tier foreground while restoring its real parent-map context."""
+    """Overlay the Tier foreground on the complete parent-map context."""
     tier_bgr = premultiply_to_bgr(tier_patch_bgra).astype(np.float32)
     alpha = tier_patch_bgra[..., 3].astype(np.float32) / 255.0
-    active = (alpha > 10 / 255.0).astype(np.uint8) * 255
-    radius = CONFIG["TIER_CONTEXT_RING_RADIUS"]
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (radius * 2 + 1, radius * 2 + 1),
-    )
-    ring = cv2.dilate(active, kernel)
-    ring = cv2.GaussianBlur(ring, (0, 0), sigmaX=3.0).astype(np.float32) / 255.0
-    ring *= (1.0 - alpha) * CONFIG["TIER_CONTEXT_RING_ALPHA"]
-    result = tier_bgr * alpha[..., None]
-    result += parent_patch_bgr.astype(np.float32) * ring[..., None]
+    parent = parent_patch_bgr.astype(np.float32)
+    result = tier_bgr * alpha[..., None] + parent * (1.0 - alpha[..., None])
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
