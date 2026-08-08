@@ -1502,6 +1502,10 @@ def generate_samples(
         if random_sampling_only
         else build_scale_jitter_schedule(len(center_schedule))
     )
+    if sample_region is not None:
+        # Base 每个合法位置的首轮样本保持干净、原比例；其余轮次承接全部扰动配额。
+        ui_clutter_schedule.sort(key=lambda level: level != UiClutter.NONE)
+        scale_schedule.sort(key=lambda scale: scale != 1.0)
     min_cx, max_cx = region_x + pad, region_x2 - 1 + pad
     min_cy, max_cy = region_y + pad, region_y2 - 1 + pad
 
@@ -1547,7 +1551,10 @@ def generate_samples(
                 parent_patch,
                 tier_context["mask_mode"],
             )
-        if light_aug:
+        base_anchor = sample_region is not None and index < len(valid_centers)
+        if base_anchor:
+            sample = apply_minimap_mask(patch_bgr)
+        elif light_aug:
             sample = augment_patch_light(patch_bgr, ui_clutter)
         else:
             sample = augment_patch(patch_bgr, safe_size, ui_clutter)
