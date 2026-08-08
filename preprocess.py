@@ -857,20 +857,23 @@ def compose_tier_context_patch(
         dark = (opaque & (gray <= 12)).astype(np.uint8)
         _, labels = cv2.connectedComponents(dark, 8)
         ys, xs = np.nonzero(opaque)
-        min_y, max_y = ys.min(), ys.max()
-        min_x, max_x = xs.min(), xs.max()
-        border_labels = np.unique(
-            np.concatenate(
-                (
-                    labels[min_y, min_x : max_x + 1],
-                    labels[max_y, min_x : max_x + 1],
-                    labels[min_y : max_y + 1, min_x],
-                    labels[min_y : max_y + 1, max_x],
+        if not len(xs):
+            foreground = np.zeros_like(opaque)
+        else:
+            min_y, max_y = ys.min(), ys.max()
+            min_x, max_x = xs.min(), xs.max()
+            border_labels = np.unique(
+                np.concatenate(
+                    (
+                        labels[min_y, min_x : max_x + 1],
+                        labels[max_y, min_x : max_x + 1],
+                        labels[min_y : max_y + 1, min_x],
+                        labels[min_y : max_y + 1, max_x],
+                    )
                 )
             )
-        )
-        border_dark = np.isin(labels, border_labels) & (labels > 0)
-        foreground = (alpha > 10 / 255.0) & ~border_dark
+            border_dark = np.isin(labels, border_labels) & (labels > 0)
+            foreground = opaque & ~border_dark
     foreground_alpha = alpha * foreground.astype(np.float32)
     parent = parent_patch_bgr.astype(np.float32)
     result = tier_bgr * foreground_alpha[..., None] + parent * (
