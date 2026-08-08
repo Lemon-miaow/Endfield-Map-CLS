@@ -103,6 +103,7 @@ CONFIG = {
     "MIN_ALPHA_CIRCLE_COVERAGE": 0.12,
     "TIER_MIN_MAP_CIRCLE_COVERAGE": 0.02,
     "TIER_MIN_ALPHA_CIRCLE_COVERAGE": 0.08,
+    "TIER_PARENT_INTENSITY": 0.28,
     "MIN_VALID_STD": 8.0,
     "MIN_VALID_CENTERS_PER_TILE": 24,
 }
@@ -875,7 +876,7 @@ def compose_tier_context_patch(
             border_dark = np.isin(labels, border_labels) & (labels > 0)
             foreground = opaque & ~border_dark
     foreground_alpha = alpha * foreground.astype(np.float32)
-    parent = parent_patch_bgr.astype(np.float32)
+    parent = parent_patch_bgr.astype(np.float32) * CONFIG["TIER_PARENT_INTENSITY"]
     result = tier_bgr * foreground_alpha[..., None] + parent * (
         1.0 - foreground_alpha[..., None]
     )

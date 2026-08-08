@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from preprocess import (
+    CONFIG,
     build_tier_parent_context,
     compose_tier_context_patch,
     get_safe_size,
@@ -91,7 +92,10 @@ class MapExportContractTests(unittest.TestCase):
             self.assertGreater(int(output[center + 16, center + 16].sum()), 0)
             np.testing.assert_array_equal(
                 output[center + 20, center + 20],
-                context["parent_aligned"][center + 20, center + 20],
+                (
+                    context["parent_aligned"][center + 20, center + 20]
+                    * CONFIG["TIER_PARENT_INTENSITY"]
+                ).astype(np.uint8),
             )
 
 
