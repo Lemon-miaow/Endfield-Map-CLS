@@ -101,6 +101,11 @@ CONFIG = {
     "ULTRA_UI_RADIUS_MIN": 16,
     "ULTRA_UI_RADIUS_MAX": 32,
     "ULTRA_UI_CHAIN_PROB": 0.85,
+    "TIER_CENTER_UI_EXTRA_RATIO": 0.20,
+    "TIER_CENTER_UI_ICONS_MIN": 5,
+    "TIER_CENTER_UI_ICONS_MAX": 8,
+    "TIER_CENTER_UI_RADIUS": 18,
+    "TIER_CENTER_UI_SCALE_MAX": 1.50,
     "UI_POINTER_PROB": 1.0,
     "MIN_MAP_CIRCLE_COVERAGE": 0.10,
     "MIN_MAP_CENTER_COVERAGE": 0.035,
@@ -117,6 +122,7 @@ class UiClutter(IntEnum):
     NONE = 0
     EXTREME = 1
     ULTRA = 2
+    TIER_CENTER = 3
 
 
 class BackgroundProfile(IntEnum):
@@ -451,12 +457,21 @@ def overlay_rgba_on_bgr(dst_bgr: np.ndarray, icon_rgba: np.ndarray, x: int, y: i
     return dst_bgr
 
 
-def _sample_normal_ui_icon(normal_icons: dict, icon_names: list[str], name: str | None = None) -> np.ndarray:
+def _sample_normal_ui_icon(
+    normal_icons: dict,
+    icon_names: list[str],
+    name: str | None = None,
+    scale_multiplier: float = 1.0,
+) -> np.ndarray:
     if name is None:
         name = random.choice(icon_names)
 
     jitter = CONFIG["UI_ICON_SCALE_JITTER"]
-    scale = CONFIG["UI_ICON_SCALE"] * random.uniform(1.0 - jitter, 1.0 + jitter)
+    scale = (
+        CONFIG["UI_ICON_SCALE"]
+        * scale_multiplier
+        * random.uniform(1.0 - jitter, 1.0 + jitter)
+    )
     icon = resize_rgba(
         normal_icons[name],
         scale,
@@ -566,6 +581,52 @@ def add_extreme_icon_clutter(
     return out
 
 
+def add_tier_center_icon_cluster(
+    result: np.ndarray,
+    normal_icons: dict,
+    icon_names: list[str],
+    landmarks: list[np.ndarray],
+) -> np.ndarray:
+    """叠加靠近玩家指针的大号图标簇，覆盖真实 Tier 的中心遮挡。"""
+    if not icon_names and not landmarks:
+        return result
+
+    count = random.randint(
+        CONFIG["TIER_CENTER_UI_ICONS_MIN"],
+        CONFIG["TIER_CENTER_UI_ICONS_MAX"],
+    )
+    icons = []
+    if landmarks:
+        icons.append(resize_rgba(random.choice(landmarks), random.uniform(0.95, 1.15)))
+
+    icons.extend(
+        _sample_normal_ui_icon(
+            normal_icons,
+            icon_names,
+            scale_multiplier=random.uniform(
+                1.0,
+                CONFIG["TIER_CENTER_UI_SCALE_MAX"],
+            ),
+        )
+        for _ in range(count - len(icons))
+        if icon_names
+    )
+    random.shuffle(icons)
+
+    h, w = result.shape[:2]
+    radius = CONFIG["TIER_CENTER_UI_RADIUS"]
+    cx = w // 2 + random.randint(-radius // 2, radius // 2)
+    cy = h // 2 + random.randint(-radius // 2, radius // 2)
+    out = result.copy()
+    for icon in icons:
+        ih, iw = icon.shape[:2]
+        x = cx + round(random.gauss(0, radius * 0.45)) - iw // 2
+        y = cy + round(random.gauss(0, radius * 0.45)) - ih // 2
+        out = overlay_rgba_on_bgr(out, icon, x, y)
+
+    return out
+
+
 ZONE_YELLOW_BGR = (28, 168, 185)
 ZONE_BLUE_BGR = (235, 205, 135)
 
@@ -654,6 +715,15 @@ def add_random_map_icons(
 
     normal_icons = ui_icons["normal"]
     icon_names = list(normal_icons.keys())
+    landmarks = ui_icons["landmarks"]
+    if ui_clutter == UiClutter.TIER_CENTER:
+        return add_tier_center_icon_cluster(
+            result,
+            normal_icons,
+            icon_names,
+            landmarks,
+        )
+
     if icon_names:
         use_count = random.randint(CONFIG["UI_ICON_MIN_COUNT"], CONFIG["UI_ICON_MAX_COUNT"])
 
@@ -675,7 +745,6 @@ def add_random_map_icons(
                 ui_clutter,
             )
 
-    landmarks = ui_icons["landmarks"]
     if landmarks and random.random() < CONFIG["UI_LANDMARK_PROB"]:
         landmark = resize_rgba(random.choice(landmarks), random.uniform(0.9, 1.1))
         ih, iw = landmark.shape[:2]
@@ -1573,6 +1642,25 @@ def generate_samples(
         )
         target = train_only_samples if train_only else samples
         target.append(sample)
+
+    if light_aug:
+        center_ui_count = round(target_count * CONFIG["TIER_CENTER_UI_EXTRA_RATIO"])
+        center_ui_centers = build_balanced_schedule(valid_centers, center_ui_count)
+        center_ui_scales = build_scale_jitter_schedule(center_ui_count)
+        for (cx, cy), scale in zip(center_ui_centers, center_ui_scales):
+            patch_bgr = compose_patch(
+                img,
+                cx,
+                cy,
+                0,
+                safe_size,
+                bg_paths,
+                scale,
+                background_profile=background_profile,
+                tier_context=tier_context,
+            )
+            sample = augment_patch_light(patch_bgr, UiClutter.TIER_CENTER)
+            train_only_samples.append(finalize_positive_map_sample(sample))
 
     if random_sampling_only:
         return samples, train_only_samples

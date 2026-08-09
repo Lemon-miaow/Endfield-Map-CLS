@@ -22,6 +22,7 @@ from preprocess import (
     add_black_outline_rgba,
     add_error_training_samples,
     add_extreme_icon_clutter,
+    add_tier_center_icon_cluster,
     apply_background_composition,
     build_balanced_schedule,
     build_scale_jitter_schedule,
@@ -220,6 +221,36 @@ class UiCompositionTests(unittest.TestCase):
         self.assertEqual(len(icons["landmarks"]), 1)
         self.assertTupleEqual(icons["landmarks"][0].shape[:2], (22, 22))
 
+    def test_tier_center_cluster_combines_landmark_and_large_icons(self) -> None:
+        image = np.zeros((128, 128, 3), dtype=np.uint8)
+        normal_icons = {"icon.png": np.full((8, 8, 4), 255, dtype=np.uint8)}
+        landmarks = [np.full((12, 12, 4), 255, dtype=np.uint8)]
+        sampled = np.full((4, 4, 4), 255, dtype=np.uint8)
+
+        with (
+            patch.dict(
+                CONFIG,
+                {
+                    "TIER_CENTER_UI_ICONS_MIN": 6,
+                    "TIER_CENTER_UI_ICONS_MAX": 6,
+                    "TIER_CENTER_UI_RADIUS": 0,
+                },
+            ),
+            patch("preprocess._sample_normal_ui_icon", return_value=sampled),
+            patch(
+                "preprocess.overlay_rgba_on_bgr",
+                side_effect=lambda result, *_: result,
+            ) as overlay,
+        ):
+            add_tier_center_icon_cluster(
+                image,
+                normal_icons,
+                ["icon.png"],
+                landmarks,
+            )
+
+        self.assertEqual(overlay.call_count, 6)
+
     def test_positive_sample_always_contains_center_pointer(self) -> None:
         random.seed(7)
         image = np.zeros(
@@ -309,6 +340,68 @@ class TierSamplingTests(unittest.TestCase):
 
         self.assertEqual(int(standard.mean()), 222)
         self.assertEqual(int(tier.mean()), 0)
+
+    def test_center_icon_samples_are_train_only_and_keep_clean_quota(self) -> None:
+        safe_size = 182
+        pad = safe_size // 2
+        size = 192
+        yy, xx = np.indices((size, size))
+        texture = np.stack(
+            (
+                (xx * 3 + yy) % 255,
+                (xx + yy * 5) % 255,
+                (xx * 7 + yy * 2) % 255,
+            ),
+            axis=2,
+        ).astype(np.uint8)
+        image = np.zeros((size + pad * 2, size + pad * 2, 4), dtype=np.uint8)
+        image[pad : pad + size, pad : pad + size, :3] = texture
+        image[pad : pad + size, pad : pad + size, 3] = 255
+        tier_context = {
+            "parent_aligned": np.zeros(image.shape[:2] + (3,), dtype=np.uint8),
+            "mask_mode": "opaque",
+        }
+
+        with (
+            patch.dict(
+                CONFIG,
+                {
+                    "TIER_CENTER_UI_EXTRA_RATIO": 0.20,
+                    "UI_ZONE_EXTRA_RATIO": 0.0,
+                    "SCALE_JITTER_RATIO": 0.0,
+                    "EXTREME_UI_PROB": 0.0,
+                    "ULTRA_UI_PROB": 0.0,
+                },
+            ),
+            patch(
+                "preprocess.augment_patch_light",
+                side_effect=lambda sample, clutter=UiClutter.NONE: np.full_like(
+                    sample,
+                    int(clutter),
+                ),
+            ),
+            patch(
+                "preprocess.finalize_positive_map_sample",
+                side_effect=lambda sample: sample,
+            ),
+        ):
+            samples, train_only_samples = generate_samples(
+                image,
+                safe_size,
+                [],
+                target_count=20,
+                light_aug=True,
+                tier_context=tier_context,
+            )
+
+        self.assertEqual(len(samples), 20)
+        self.assertEqual(len(train_only_samples), 4)
+        self.assertTrue(
+            all(
+                np.all(sample == int(UiClutter.TIER_CENTER))
+                for sample in train_only_samples
+            )
+        )
 
 
 class CuratedSampleTests(unittest.TestCase):
