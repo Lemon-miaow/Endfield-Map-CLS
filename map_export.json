@@ -1,0 +1,1341 @@
+{
+  "format": "map-cls-export-v1",
+  "bases": {
+    "Dung01Base.png": {
+      "file": "Dung01Base.png",
+      "size": [
+        768,
+        960
+      ]
+    },
+    "IndieDg005Base.png": {
+      "file": "IndieDg005Base.png",
+      "size": [
+        288,
+        288
+      ]
+    },
+    "IndieDg007Base.png": {
+      "file": "IndieDg007Base.png",
+      "size": [
+        768,
+        768
+      ]
+    },
+    "Map01Base.png": {
+      "file": "Map01Base.png",
+      "size": [
+        1440,
+        1350
+      ]
+    },
+    "Map02Base.png": {
+      "file": "Map02Base.png",
+      "size": [
+        2016,
+        2976
+      ]
+    },
+    "OMVBase01.png": {
+      "file": "OMVBase01.png",
+      "size": [
+        384,
+        384
+      ]
+    }
+  },
+  "tiers": {
+    "Dung01Tier186": {
+      "template": "Dung01Tier186.png",
+      "parent": "Dung01Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        768,
+        960
+      ],
+      "tier_to_parent": [
+        1.0,
+        352.0,
+        1.0,
+        448.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Dung01Tier187": {
+      "template": "Dung01Tier187.png",
+      "parent": "Dung01Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        768,
+        960
+      ],
+      "tier_to_parent": [
+        1.0,
+        352.0,
+        1.0,
+        352.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Dung01Tier52": {
+      "template": "Dung01Tier52.png",
+      "parent": "Dung01Base.png",
+      "template_size": [
+        256,
+        352
+      ],
+      "parent_size": [
+        768,
+        960
+      ],
+      "tier_to_parent": [
+        1.0,
+        256.0,
+        1.0,
+        352.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Dung01Tier54": {
+      "template": "Dung01Tier54.png",
+      "parent": "Dung01Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        768,
+        960
+      ],
+      "tier_to_parent": [
+        1.0,
+        256.0,
+        1.0,
+        352.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Dung01Tier56": {
+      "template": "Dung01Tier56.png",
+      "parent": "Dung01Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        768,
+        960
+      ],
+      "tier_to_parent": [
+        1.0,
+        160.0,
+        1.0,
+        352.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Dung01Tier62": {
+      "template": "Dung01Tier62.png",
+      "parent": "Dung01Base.png",
+      "template_size": [
+        160,
+        256
+      ],
+      "parent_size": [
+        768,
+        960
+      ],
+      "tier_to_parent": [
+        1.0,
+        352.0,
+        1.0,
+        448.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Dung01Tier63": {
+      "template": "Dung01Tier63.png",
+      "parent": "Dung01Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        768,
+        960
+      ],
+      "tier_to_parent": [
+        1.0,
+        256.0,
+        1.0,
+        448.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Dung01Tier66": {
+      "template": "Dung01Tier66.png",
+      "parent": "Dung01Base.png",
+      "template_size": [
+        160,
+        256
+      ],
+      "parent_size": [
+        768,
+        960
+      ],
+      "tier_to_parent": [
+        1.0,
+        448.0,
+        1.0,
+        160.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "IndieDg007Tier335": {
+      "template": "IndieDg007Tier335.png",
+      "parent": "IndieDg007Base.png",
+      "template_size": [
+        448,
+        448
+      ],
+      "parent_size": [
+        768,
+        768
+      ],
+      "tier_to_parent": [
+        1.0,
+        160.0,
+        1.0,
+        160.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "IndieDg007Tier336": {
+      "template": "IndieDg007Tier336.png",
+      "parent": "IndieDg007Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        768,
+        768
+      ],
+      "tier_to_parent": [
+        1.0,
+        256.0,
+        1.0,
+        256.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "IndieDg007Tier337": {
+      "template": "IndieDg007Tier337.png",
+      "parent": "IndieDg007Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        768,
+        768
+      ],
+      "tier_to_parent": [
+        1.0,
+        256.0,
+        1.0,
+        256.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "IndieDg007Tier338": {
+      "template": "IndieDg007Tier338.png",
+      "parent": "IndieDg007Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        768,
+        768
+      ],
+      "tier_to_parent": [
+        1.0,
+        256.0,
+        1.0,
+        256.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map01Lv001Tier114": {
+      "template": "Map01Lv001Tier114.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        160,
+        256
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        690.0,
+        0.9375,
+        780.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv001Tier115": {
+      "template": "Map01Lv001Tier115.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        160,
+        256
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        690.0,
+        0.9375,
+        780.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv001Tier171": {
+      "template": "Map01Lv001Tier171.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        160,
+        256
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        600.0,
+        0.9375,
+        690.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv001Tier172": {
+      "template": "Map01Lv001Tier172.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        160,
+        256
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        600.0,
+        0.9375,
+        690.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv001Tier173": {
+      "template": "Map01Lv001Tier173.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        150.0,
+        0.9375,
+        780.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv001Tier174": {
+      "template": "Map01Lv001Tier174.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        256,
+        160
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        240.0,
+        0.9375,
+        780.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv001Tier189": {
+      "template": "Map01Lv001Tier189.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        160,
+        256
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        600.0,
+        0.9375,
+        780.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv002Tier120": {
+      "template": "Map01Lv002Tier120.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        60.0,
+        0.9375,
+        420.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv003Tier17": {
+      "template": "Map01Lv003Tier17.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        870.0,
+        0.9375,
+        960.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv003Tier18": {
+      "template": "Map01Lv003Tier18.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        160,
+        160
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        780.0,
+        0.9375,
+        1050.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv003Tier19": {
+      "template": "Map01Lv003Tier19.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        160,
+        256
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        780.0,
+        0.9375,
+        1050.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv003Tier31": {
+      "template": "Map01Lv003Tier31.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        870.0,
+        0.9375,
+        960.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv005Tier175": {
+      "template": "Map01Lv005Tier175.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        256,
+        160
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        1050.0,
+        0.9375,
+        690.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv005Tier177": {
+      "template": "Map01Lv005Tier177.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        352,
+        352
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        960.0,
+        0.9375,
+        600.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv006Tier107": {
+      "template": "Map01Lv006Tier107.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        160,
+        160
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        870.0,
+        0.9375,
+        330.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv006Tier109": {
+      "template": "Map01Lv006Tier109.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        256,
+        352
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        870.0,
+        0.9375,
+        330.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv006Tier86": {
+      "template": "Map01Lv006Tier86.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        160,
+        160
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        1050.0,
+        0.9375,
+        330.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv006Tier87": {
+      "template": "Map01Lv006Tier87.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        1050.0,
+        0.9375,
+        330.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv007Tier130": {
+      "template": "Map01Lv007Tier130.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        330.0,
+        0.9375,
+        60.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv007Tier133": {
+      "template": "Map01Lv007Tier133.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        256,
+        448
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        600.0,
+        0.9375,
+        60.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv007Tier135": {
+      "template": "Map01Lv007Tier135.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        420.0,
+        0.9375,
+        60.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv007Tier281": {
+      "template": "Map01Lv007Tier281.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        160,
+        256
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        600.0,
+        0.9375,
+        150.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map01Lv007Tier81": {
+      "template": "Map01Lv007Tier81.png",
+      "parent": "Map01Base.png",
+      "template_size": [
+        160,
+        256
+      ],
+      "parent_size": [
+        1440,
+        1350
+      ],
+      "tier_to_parent": [
+        0.9375,
+        600.0,
+        0.9375,
+        60.0
+      ],
+      "mask_mode": "bright"
+    },
+    "Map02Lv002Tier254": {
+      "template": "Map02Lv002Tier254.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        160,
+        160
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        832.0,
+        1.0,
+        1888.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv002Tier255": {
+      "template": "Map02Lv002Tier255.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        256,
+        160
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        832.0,
+        1.0,
+        1888.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv002Tier257": {
+      "template": "Map02Lv002Tier257.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        160,
+        256
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        832.0,
+        1.0,
+        1600.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv002Tier258": {
+      "template": "Map02Lv002Tier258.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        160,
+        256
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        832.0,
+        1.0,
+        1600.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv002Tier259": {
+      "template": "Map02Lv002Tier259.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        160,
+        256
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        832.0,
+        1.0,
+        1600.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv002Tier275": {
+      "template": "Map02Lv002Tier275.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        256,
+        160
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        832.0,
+        1.0,
+        1888.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv002Tier276": {
+      "template": "Map02Lv002Tier276.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        832.0,
+        1.0,
+        1600.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv003Tier294": {
+      "template": "Map02Lv003Tier294.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        256,
+        160
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1216.0,
+        1.0,
+        2272.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv003Tier295": {
+      "template": "Map02Lv003Tier295.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1216.0,
+        1.0,
+        2272.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv003Tier296": {
+      "template": "Map02Lv003Tier296.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        352,
+        256
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1120.0,
+        1.0,
+        1984.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv003Tier297": {
+      "template": "Map02Lv003Tier297.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1216.0,
+        1.0,
+        2080.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv003Tier298": {
+      "template": "Map02Lv003Tier298.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1216.0,
+        1.0,
+        2176.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv003Tier299": {
+      "template": "Map02Lv003Tier299.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1024.0,
+        1.0,
+        2176.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv004Tier328": {
+      "template": "Map02Lv004Tier328.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        352,
+        352
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        256.0,
+        1.0,
+        2368.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv004Tier330": {
+      "template": "Map02Lv004Tier330.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        448.0,
+        1.0,
+        1984.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv005Tier314": {
+      "template": "Map02Lv005Tier314.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        256,
+        160
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1120.0,
+        1.0,
+        1408.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv005Tier316": {
+      "template": "Map02Lv005Tier316.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        160,
+        256
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1024.0,
+        1.0,
+        1312.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv005Tier318": {
+      "template": "Map02Lv005Tier318.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1216.0,
+        1.0,
+        1408.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv005Tier319": {
+      "template": "Map02Lv005Tier319.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1216.0,
+        1.0,
+        1408.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv005Tier321": {
+      "template": "Map02Lv005Tier321.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        256,
+        160
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1216.0,
+        1.0,
+        1600.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv005Tier322": {
+      "template": "Map02Lv005Tier322.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        352,
+        160
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1120.0,
+        1.0,
+        1600.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv005Tier324": {
+      "template": "Map02Lv005Tier324.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        160,
+        256
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1120.0,
+        1.0,
+        1600.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv005Tier326": {
+      "template": "Map02Lv005Tier326.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        160,
+        160
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1120.0,
+        1.0,
+        1600.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv007Tier392": {
+      "template": "Map02Lv007Tier392.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        256,
+        160
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1120.0,
+        1.0,
+        736.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv007Tier393": {
+      "template": "Map02Lv007Tier393.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        256,
+        160
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1120.0,
+        1.0,
+        736.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv008Tier375": {
+      "template": "Map02Lv008Tier375.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1024.0,
+        1.0,
+        448.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv008Tier377": {
+      "template": "Map02Lv008Tier377.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        256,
+        352
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1120.0,
+        1.0,
+        352.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv008Tier379": {
+      "template": "Map02Lv008Tier379.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        352,
+        256
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1120.0,
+        1.0,
+        160.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv008Tier381": {
+      "template": "Map02Lv008Tier381.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        160,
+        256
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1504.0,
+        1.0,
+        448.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv008Tier382": {
+      "template": "Map02Lv008Tier382.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        448,
+        448
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1312.0,
+        1.0,
+        256.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv008Tier384": {
+      "template": "Map02Lv008Tier384.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        256,
+        352
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1408.0,
+        1.0,
+        64.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv008Tier386": {
+      "template": "Map02Lv008Tier386.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        256,
+        256
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1024.0,
+        1.0,
+        256.0
+      ],
+      "mask_mode": "opaque"
+    },
+    "Map02Lv008Tier388": {
+      "template": "Map02Lv008Tier388.png",
+      "parent": "Map02Base.png",
+      "template_size": [
+        448,
+        448
+      ],
+      "parent_size": [
+        2016,
+        2976
+      ],
+      "tier_to_parent": [
+        1.0,
+        1120.0,
+        1.0,
+        256.0
+      ],
+      "mask_mode": "opaque"
+    }
+  }
+}
