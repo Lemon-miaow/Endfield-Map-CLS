@@ -353,20 +353,19 @@ def sanitize_rgba_alpha(icon_rgba: np.ndarray, alpha_floor: int = 8) -> np.ndarr
 def add_black_outline_rgba(
     icon_rgba: np.ndarray,
     thickness: int = 1,
-    alpha_threshold: int = 32,
+    opacity: float = 0.45,
 ) -> np.ndarray:
     alpha = icon_rgba[..., 3]
-    solid = alpha > alpha_threshold
-
     kernel = np.ones((thickness * 2 + 1, thickness * 2 + 1), np.uint8)
-    dilated = cv2.dilate(solid.astype(np.uint8) * 255, kernel, iterations=1) > 0
-    outline = dilated & (~solid)
+    dilated = cv2.dilate(alpha, kernel, iterations=1)
+    outline_alpha = np.clip(
+        (dilated.astype(np.float32) - alpha.astype(np.float32)) * opacity,
+        0,
+        255,
+    ).astype(np.uint8)
 
     outline_layer = np.zeros_like(icon_rgba)
-    outline_layer[outline, 0] = 0
-    outline_layer[outline, 1] = 0
-    outline_layer[outline, 2] = 0
-    outline_layer[outline, 3] = 255
+    outline_layer[..., 3] = outline_alpha
 
     src = icon_rgba.astype(np.float32)
     dst = outline_layer.astype(np.float32)
@@ -476,7 +475,7 @@ def _sample_normal_ui_icon(normal_icons: dict, icon_names: list[str], name: str 
         cv2.BORDER_CONSTANT,
         value=(0, 0, 0, 0),
     )
-    return add_black_outline_rgba(icon, thickness=outline, alpha_threshold=24)
+    return add_black_outline_rgba(icon, thickness=outline)
 
 
 def draw_one_normal_icon(result: np.ndarray, icon_rgba: np.ndarray, x: int, y: int) -> np.ndarray:
@@ -604,24 +603,31 @@ def draw_random_ui_lines(img: np.ndarray) -> np.ndarray:
     """绘制轻量路线线条，模拟小地图上的路径 UI。"""
     h, w = img.shape[:2]
     overlay = img.copy()
+    route_specs = (
+        ((48, 198, 215), 4),
+        ((225, 230, 230), 4),
+    )
 
-    if random.random() < 0.7:
-        num_points = random.randint(2, 4)
-        pts = np.array(
-            [[random.randint(8, w - 8), random.randint(8, h - 8)] for _ in range(num_points)],
-            np.int32
+    for color, max_points in route_specs:
+        if random.random() >= 0.7:
+            continue
+        points = [
+            sample_minimap_center(h, w)
+            for _ in range(random.randint(2, max_points))
+        ]
+        angle = random.uniform(0, math.tau)
+        axis = (math.cos(angle), math.sin(angle))
+        points.sort(key=lambda point: point[0] * axis[0] + point[1] * axis[1])
+        cv2.polylines(
+            overlay,
+            [np.asarray(points, dtype=np.int32)],
+            False,
+            color,
+            1,
+            lineType=cv2.LINE_AA,
         )
-        cv2.polylines(overlay, [pts], False, (0, 255, 255), 1)
 
-    if random.random() < 0.7:
-        num_points = random.randint(2, 5)
-        pts = np.array(
-            [[random.randint(8, w - 8), random.randint(8, h - 8)] for _ in range(num_points)],
-            np.int32
-        )
-        cv2.polylines(overlay, [pts], False, (255, 255, 255), 1)
-
-    return overlay
+    return cv2.addWeighted(overlay, 0.78, img, 0.22, 0)
 
 
 def get_ui_icon_assets(icon_dir: str = "icon") -> dict:
@@ -1042,7 +1048,7 @@ def add_central_ui_simulation(
 ) -> np.ndarray:
     """叠加可选路线和地图图标干扰。"""
     result = img.copy()
-    line_passes = 3 if ui_clutter == UiClutter.ULTRA else 1
+    line_passes = 2 if ui_clutter == UiClutter.ULTRA else 1
     for _ in range(line_passes):
         result = draw_random_ui_lines(result)
     result = add_random_map_icons(result, "icon", ui_clutter)

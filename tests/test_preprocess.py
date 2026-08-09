@@ -19,6 +19,7 @@ from preprocess import (
     ZONE_BLUE_BGR,
     ZONE_YELLOW_BGR,
     _sample_normal_ui_icon,
+    add_black_outline_rgba,
     add_error_training_samples,
     add_extreme_icon_clutter,
     apply_background_composition,
@@ -29,6 +30,7 @@ from preprocess import (
     build_zone_plan,
     build_zone_ui_clutter_schedule,
     copy_fixed_validation_samples,
+    draw_random_ui_lines,
     finalize_positive_map_sample,
     generate_samples,
     is_valid,
@@ -124,6 +126,26 @@ class BalancedSamplingTests(unittest.TestCase):
 
 
 class UiCompositionTests(unittest.TestCase):
+    def test_icon_outline_is_soft_not_opaque(self) -> None:
+        icon = np.zeros((5, 5, 4), dtype=np.uint8)
+        icon[2, 2] = (255, 255, 255, 255)
+
+        outlined = add_black_outline_rgba(icon)
+        outline_alpha = int(outlined[2, 1, 3])
+
+        self.assertGreater(outline_alpha, 0)
+        self.assertLess(outline_alpha, 255)
+
+    def test_route_lines_are_antialiased_and_translucent(self) -> None:
+        random.seed(1)
+        image = np.zeros((128, 128, 3), dtype=np.uint8)
+
+        result = draw_random_ui_lines(image)
+
+        values = np.unique(result)
+        self.assertGreater(values.size, 4)
+        self.assertLess(int(result.max()), 255)
+
     def test_blue_tint_keeps_internal_dark_details(self) -> None:
         icon = np.zeros((3, 3, 4), dtype=np.uint8)
         icon[..., 3] = 255
