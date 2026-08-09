@@ -111,6 +111,8 @@ CONFIG = {
     "MIN_MAP_CIRCLE_COVERAGE": 0.10,
     "MIN_MAP_CENTER_COVERAGE": 0.035,
     "MIN_ALPHA_CIRCLE_COVERAGE": 0.12,
+    "MIN_AUGMENTED_MAP_CIRCLE_COVERAGE": 0.25,
+    "MIN_AUGMENTED_MAP_CENTER_COVERAGE": 0.12,
     "TIER_MIN_MAP_CIRCLE_COVERAGE": 0.02,
     "TIER_MIN_ALPHA_CIRCLE_COVERAGE": 0.08,
     "TIER_PARENT_INTENSITY": 0.28,
@@ -1009,6 +1011,7 @@ def is_valid(
     patch: np.ndarray,
     *,
     min_map_circle_coverage: float | None = None,
+    min_map_center_coverage: float | None = None,
     min_alpha_circle_coverage: float | None = None,
 ) -> bool:
     """判断图块是否包含足够地图内容，过滤空洞和碎片区域。"""
@@ -1021,6 +1024,11 @@ def is_valid(
         CONFIG["MIN_ALPHA_CIRCLE_COVERAGE"]
         if min_alpha_circle_coverage is None
         else min_alpha_circle_coverage
+    )
+    min_map_center_coverage = (
+        CONFIG["MIN_MAP_CENTER_COVERAGE"]
+        if min_map_center_coverage is None
+        else min_map_center_coverage
     )
     size = CONFIG["OUTPUT_SIZE"]
     radius = CONFIG["MASK_DIAMETER"] // 2
@@ -1060,7 +1068,7 @@ def is_valid(
 
     center_area = max(1, int(np.count_nonzero(center_bool & circle_bool)))
     map_center_ratio = np.count_nonzero(map_bool & center_bool) / center_area
-    if map_center_ratio < CONFIG["MIN_MAP_CENTER_COVERAGE"]:
+    if map_center_ratio < min_map_center_coverage:
         return False
 
     valid_pixels = gray[map_bool]
@@ -1192,75 +1200,13 @@ def augment_zone_patch(
 # 背景合成
 # ---------------------------------------------------------------------------
 
-_bg_cache: dict = {}
-
-
 def apply_background_composition(
     patch_bgra: np.ndarray,
     bg_paths: list,
     profile: BackgroundProfile = BackgroundProfile.STANDARD,
 ) -> np.ndarray:
-    """将带透明通道的地图图块合成到背景域上。"""
-    if patch_bgra.shape[2] != 4:
-        return patch_bgra
-
-    h, w = patch_bgra.shape[:2]
-    bgr = patch_bgra[..., :3].astype(np.float32)
-    alpha = (patch_bgra[..., 3] / 255.0).astype(np.float32)
-    alpha = np.expand_dims(alpha, axis=-1)
-
-    rand_val = random.random()
-
-    # 保留少量真实背景干扰，主体仍贴近游戏黑底小地图。
-    if profile != BackgroundProfile.TIER and rand_val < 0.30 and bg_paths:
-        bg_path_str = str(random.choice(bg_paths))
-
-        if bg_path_str not in _bg_cache:
-            loaded_bg = safe_imread(bg_path_str)
-            if loaded_bg is not None:
-                bh, bw = loaded_bg.shape[:2]
-                max_dim = 400
-                if bh > max_dim or bw > max_dim:
-                    scale = max_dim / max(bh, bw)
-                    loaded_bg = cv2.resize(loaded_bg, (int(bw * scale), int(bh * scale)))
-            _bg_cache[bg_path_str] = loaded_bg
-
-        bg_source = _bg_cache[bg_path_str]
-
-        if bg_source is not None:
-            bg_h, bg_w = bg_source.shape[:2]
-
-            if bg_h < h or bg_w < w:
-                scale = max(h / bg_h, w / bg_w)
-                new_w, new_h = int(bg_w * scale) + 1, int(bg_h * scale) + 1
-                bg_source = cv2.resize(bg_source, (new_w, new_h))
-                bg_h, bg_w = new_h, new_w
-
-            y = random.randint(0, max(0, bg_h - h))
-            x = random.randint(0, max(0, bg_w - w))
-            bg_patch = bg_source[y : y + h, x : x + w].astype(np.float32)
-
-            if bg_patch.shape[:2] != (h, w):
-                bg_patch = cv2.resize(bg_patch, (w, h))
-        else:
-            bg_patch = np.zeros((h, w, 3), dtype=np.float32)
-
-    elif rand_val < 0.80 or profile == BackgroundProfile.TIER:
-        bg_patch = np.zeros((h, w, 3), dtype=np.float32)
-
-    elif rand_val < 0.90:
-        gray_val = random.randint(200, 255)
-        bg_patch = np.full((h, w, 3), gray_val, dtype=np.float32)
-
-    else:
-        small_noise = np.random.randint(0, 256, (16, 16, 3), dtype=np.uint8)
-        bg_patch = cv2.resize(small_noise, (w, h), interpolation=cv2.INTER_NEAREST).astype(
-            np.float32
-        )
-
-    bg_blend = random.uniform(*CONFIG["BACKGROUND_BLEND_RANGE"])
-    result = bgr * alpha + bg_patch * (1.0 - alpha) * bg_blend
-    return result.astype(np.uint8)
+    """将地图透明区域合成到游戏小地图使用的黑底上。"""
+    return premultiply_to_bgr(patch_bgra)
 
 
 # ---------------------------------------------------------------------------
@@ -1534,6 +1480,12 @@ def generate_samples(
         if light_aug
         else None
     )
+    base_center_mask = (
+        img[pad : pad + orig_h, pad : pad + orig_w, 3] > 10
+        if sample_region is not None
+        else None
+    )
+    center_mask = tier_center_mask if tier_center_mask is not None else base_center_mask
     background_profile = (
         BackgroundProfile.TIER if light_aug else BackgroundProfile.STANDARD
     )
@@ -1574,7 +1526,7 @@ def generate_samples(
     else:
         for y in range(region_y, region_y2, CONFIG["STRIDE"]):
             for x in range(region_x, region_x2, CONFIG["STRIDE"]):
-                if tier_center_mask is not None and not tier_center_mask[y, x]:
+                if center_mask is not None and not center_mask[y, x]:
                     continue
                 cx, cy = x + pad, y + pad
                 if is_valid(
@@ -1592,7 +1544,33 @@ def generate_samples(
 
     samples = []
     train_only_samples = []
-    center_schedule = build_balanced_schedule(valid_centers, target_count)
+    augmentation_centers = valid_centers
+    if sample_region is not None:
+        augmentation_centers = [
+            (cx, cy)
+            for cx, cy in valid_centers
+            if is_valid(
+                extract_roi(img, cx, cy, 0, safe_size),
+                min_map_circle_coverage=CONFIG[
+                    "MIN_AUGMENTED_MAP_CIRCLE_COVERAGE"
+                ],
+                min_map_center_coverage=CONFIG[
+                    "MIN_AUGMENTED_MAP_CENTER_COVERAGE"
+                ],
+                min_alpha_circle_coverage=min_alpha_circle_coverage,
+            )
+        ]
+        anchor_count = min(len(valid_centers), target_count)
+        center_schedule = valid_centers[:anchor_count]
+        center_schedule.extend(
+            build_balanced_schedule(
+                augmentation_centers or valid_centers,
+                target_count - anchor_count,
+            )
+        )
+    else:
+        center_schedule = build_balanced_schedule(valid_centers, target_count)
+
     ui_clutter_schedule = build_ui_clutter_schedule(len(center_schedule))
     scale_schedule = (
         [1.0] * len(center_schedule)
@@ -1603,6 +1581,9 @@ def generate_samples(
         # Base 每个合法位置的首轮样本保持干净、原比例；其余轮次承接全部扰动配额。
         ui_clutter_schedule.sort(key=lambda level: level != UiClutter.NONE)
         scale_schedule.sort(key=lambda scale: scale != 1.0)
+        if not augmentation_centers:
+            ui_clutter_schedule = [UiClutter.NONE] * len(center_schedule)
+            scale_schedule = [1.0] * len(center_schedule)
     min_cx, max_cx = region_x + pad, region_x2 - 1 + pad
     min_cy, max_cy = region_y + pad, region_y2 - 1 + pad
 
@@ -1610,12 +1591,14 @@ def generate_samples(
         zip(center_schedule, ui_clutter_schedule, scale_schedule)
     ):
         nx, ny, angle = cx, cy, 0.0
-        if index >= len(valid_centers):
+        if index >= len(valid_centers) and (
+            sample_region is None or augmentation_centers
+        ):
             # Tile 标签由中心点决定，随机位移不能跨入相邻 tile。
             nx = min(max(cx + random.randint(-5, 5), min_cx), max_cx)
             ny = min(max(cy + random.randint(-5, 5), min_cy), max_cy)
             angle = random.uniform(-CONFIG["ANGLE_JITTER"], CONFIG["ANGLE_JITTER"])
-            if tier_center_mask is not None and not tier_center_mask[ny - pad, nx - pad]:
+            if center_mask is not None and not center_mask[ny - pad, nx - pad]:
                 nx, ny = cx, cy
 
         patch = extract_roi(img, nx, ny, angle, safe_size, scale)
@@ -1649,7 +1632,10 @@ def generate_samples(
                 tier_context["mask_mode"],
             )
         base_anchor = sample_region is not None and index < len(valid_centers)
-        if base_anchor:
+        base_clean = base_anchor or (
+            sample_region is not None and not augmentation_centers
+        )
+        if base_clean:
             sample = apply_minimap_mask(patch_bgr)
         elif light_aug:
             sample = augment_patch_light(patch_bgr, ui_clutter)
@@ -1696,7 +1682,10 @@ def generate_samples(
         return samples, train_only_samples
 
     zone_count = round(target_count * CONFIG["UI_ZONE_EXTRA_RATIO"])
-    train_zone_plan, split_zone_plan = build_zone_plan(valid_centers, zone_count)
+    zone_centers = (
+        augmentation_centers if sample_region is not None else valid_centers
+    )
+    train_zone_plan, split_zone_plan = build_zone_plan(zone_centers, zone_count)
     if sample_region is None:
         split_zone_plan.extend(train_zone_plan)
         random.shuffle(split_zone_plan)

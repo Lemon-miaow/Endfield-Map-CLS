@@ -337,23 +337,81 @@ class TierSamplingTests(unittest.TestCase):
             )
         )
 
-    def test_tier_background_rejects_white_synthetic_branch(self) -> None:
+    def test_positive_map_background_is_always_black(self) -> None:
         image = np.zeros((32, 32, 4), dtype=np.uint8)
+        image[8:24, 8:24] = (30, 60, 90, 255)
+
+        standard = apply_background_composition(image, [Path("unused.png")])
+        tier = apply_background_composition(image, [], BackgroundProfile.TIER)
+
+        for result in (standard, tier):
+            self.assertTupleEqual(tuple(result[0, 0]), (0, 0, 0))
+            self.assertTupleEqual(tuple(result[16, 16]), (30, 60, 90))
+
+    def test_low_signal_base_centers_never_receive_ui_or_zones(self) -> None:
+        safe_size = 182
+        pad = safe_size // 2
+        image = np.zeros((256 + pad * 2, 256 + pad * 2, 4), dtype=np.uint8)
+        image[pad : pad + 256, pad : pad + 256, 3] = 255
+
+        def valid_for_clean_anchor(_image, **kwargs):
+            return kwargs.get("min_map_center_coverage") is None
 
         with (
-            patch("preprocess.random.random", return_value=0.85),
-            patch("preprocess.random.randint", return_value=222),
-            patch("preprocess.random.uniform", return_value=1.0),
+            patch("preprocess.is_valid", side_effect=valid_for_clean_anchor),
+            patch("preprocess.augment_patch") as augment,
+            patch("preprocess.augment_zone_patch") as augment_zone,
+            patch(
+                "preprocess.finalize_positive_map_sample",
+                side_effect=lambda sample: sample,
+            ),
         ):
-            standard = apply_background_composition(image, [])
-            tier = apply_background_composition(
+            samples, train_only_samples = generate_samples(
                 image,
+                safe_size,
                 [],
-                BackgroundProfile.TIER,
+                sample_region=(96, 96, 64, 64),
+                target_count=96,
             )
 
-        self.assertEqual(int(standard.mean()), 222)
-        self.assertEqual(int(tier.mean()), 0)
+        self.assertEqual(len(samples), 32)
+        self.assertEqual(len(train_only_samples), 64)
+        augment.assert_not_called()
+        augment_zone.assert_not_called()
+
+    def test_base_pointer_center_never_lands_on_transparent_void(self) -> None:
+        safe_size = 182
+        pad = safe_size // 2
+        image = np.zeros((256 + pad * 2, 256 + pad * 2, 4), dtype=np.uint8)
+        image[pad : pad + 256, pad : pad + 128, 3] = 255
+        sampled_centers = []
+
+        def extract_at_center(_image, cx, cy, *_args):
+            sampled_centers.append((cx - pad, cy - pad))
+            patch = np.zeros((CONFIG["OUTPUT_SIZE"], CONFIG["OUTPUT_SIZE"], 4), dtype=np.uint8)
+            patch[..., 3] = 255
+            return patch
+
+        with (
+            patch("preprocess.extract_roi", side_effect=extract_at_center),
+            patch("preprocess.is_valid", return_value=True),
+            patch("preprocess.augment_patch", side_effect=lambda sample, *_: sample),
+            patch(
+                "preprocess.finalize_positive_map_sample",
+                side_effect=lambda sample: sample,
+            ),
+            patch.dict(CONFIG, {"UI_ZONE_EXTRA_RATIO": 0.0}),
+        ):
+            generate_samples(
+                image,
+                safe_size,
+                [],
+                sample_region=(96, 96, 64, 64),
+                target_count=64,
+            )
+
+        self.assertTrue(sampled_centers)
+        self.assertTrue(all(x < 128 for x, _y in sampled_centers))
 
     def test_center_icon_samples_are_train_only_and_keep_base_quota(self) -> None:
         safe_size = 182
