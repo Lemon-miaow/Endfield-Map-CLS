@@ -24,6 +24,8 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+from train import find_latest_model
+
 # 推理预处理规格（与训练集 / C++ 推理端保持一致）
 CONFIG = {
     "OUTPUT_SIZE": 128,    # 预处理输出图像的边长（像素）
@@ -85,18 +87,14 @@ class Predictor:
                 raise FileNotFoundError(f"Specified model not found: {path}")
             return path
 
-        runs_dir = Path("runs/classify")
-        if not runs_dir.exists():
+        latest = find_latest_model("runs/classify")
+        if not latest:
             raise FileNotFoundError(
-                "No training runs found in 'runs/classify'. "
+                "No selected.pt or best.pt found in 'runs/classify'. "
                 "Please train a model first or specify a path with --model."
             )
 
-        candidates = list(runs_dir.rglob("weights/best.pt"))
-        if not candidates:
-            raise FileNotFoundError("No 'best.pt' found in training runs.")
-
-        latest_model = max(candidates, key=lambda p: p.stat().st_mtime)
+        latest_model = Path(latest)
         logger.info(f"Auto-detected latest model: {latest_model}")
         return latest_model
 

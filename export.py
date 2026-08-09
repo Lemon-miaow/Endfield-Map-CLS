@@ -21,31 +21,29 @@ from pathlib import Path
 
 from ultralytics import YOLO
 
+from train import find_latest_model as find_latest_candidate
+
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 
 def find_latest_model(base_dir: str = "runs/classify") -> Path:
-    """在训练输出目录中查找修改时间最新的 best.pt 权重文件。
+    """在训练输出目录中查找修改时间最新的候选权重。
 
     Args:
         base_dir: 训练结果根目录，默认为 runs/classify。
 
     Returns:
-        最新 best.pt 的 Path 对象。
+        最新 selected.pt 或 best.pt 的 Path 对象。
 
     Raises:
-        FileNotFoundError: 目录不存在或其中没有 best.pt 时抛出。
+        FileNotFoundError: 目录中没有候选权重时抛出。
     """
-    base_path = Path(base_dir)
-    if not base_path.exists():
-        raise FileNotFoundError(f"Directory not found: {base_dir}")
+    latest = find_latest_candidate(base_dir)
+    if not latest:
+        raise FileNotFoundError(f"No selected.pt or best.pt found in {base_dir}")
 
-    candidates = list(base_path.rglob("weights/best.pt"))
-    if not candidates:
-        raise FileNotFoundError(f"No 'best.pt' found in {base_dir}")
-
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    return Path(latest)
 
 
 def export_model(model_path: str, imgsz: int, meta_config_path: str) -> None:
