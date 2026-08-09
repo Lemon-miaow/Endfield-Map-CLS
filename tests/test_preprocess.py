@@ -27,6 +27,7 @@ from preprocess import (
     build_balanced_schedule,
     build_scale_jitter_schedule,
     build_tier_center_mask,
+    build_tier_center_ui_plan,
     build_ui_clutter_schedule,
     build_zone_plan,
     build_zone_ui_clutter_schedule,
@@ -294,6 +295,19 @@ class UiCompositionTests(unittest.TestCase):
 
 
 class TierSamplingTests(unittest.TestCase):
+    def test_center_ui_plan_covers_every_center_and_balances_zones(self) -> None:
+        random.seed(7)
+        centers = [(index, 0) for index in range(100)]
+
+        plan = build_tier_center_ui_plan(centers, target_count=20)
+        colors = [color for _center, color in plan]
+
+        self.assertEqual(len(plan), 100)
+        self.assertEqual({center for center, _color in plan}, set(centers))
+        self.assertEqual(colors.count(ZONE_YELLOW_BGR), 49)
+        self.assertEqual(colors.count(ZONE_BLUE_BGR), 16)
+        self.assertEqual(colors.count(None), 35)
+
     def test_center_mask_keeps_only_structure_neighborhood(self) -> None:
         image = np.zeros((64, 64, 4), dtype=np.uint8)
         image[:8, :8, 3] = 255
@@ -341,7 +355,7 @@ class TierSamplingTests(unittest.TestCase):
         self.assertEqual(int(standard.mean()), 222)
         self.assertEqual(int(tier.mean()), 0)
 
-    def test_center_icon_samples_are_train_only_and_keep_clean_quota(self) -> None:
+    def test_center_icon_samples_are_train_only_and_keep_base_quota(self) -> None:
         safe_size = 182
         pad = safe_size // 2
         size = 192
@@ -383,6 +397,22 @@ class TierSamplingTests(unittest.TestCase):
             patch(
                 "preprocess.finalize_positive_map_sample",
                 side_effect=lambda sample: sample,
+            ),
+            patch(
+                "preprocess.build_tier_center_ui_plan",
+                return_value=[
+                    ((pad + 64, pad + 64), None),
+                    ((pad + 72, pad + 64), ZONE_YELLOW_BGR),
+                    ((pad + 64, pad + 72), ZONE_BLUE_BGR),
+                    ((pad + 72, pad + 72), None),
+                ],
+            ),
+            patch(
+                "preprocess.augment_zone_patch",
+                side_effect=lambda sample, _color, clutter: np.full_like(
+                    sample,
+                    int(clutter),
+                ),
             ),
         ):
             samples, train_only_samples = generate_samples(

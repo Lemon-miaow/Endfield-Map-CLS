@@ -106,6 +106,7 @@ CONFIG = {
     "TIER_CENTER_UI_ICONS_MAX": 8,
     "TIER_CENTER_UI_RADIUS": 18,
     "TIER_CENTER_UI_SCALE_MAX": 1.50,
+    "TIER_CENTER_UI_ZONE_RATIO": 0.65,
     "UI_POINTER_PROB": 1.0,
     "MIN_MAP_CIRCLE_COVERAGE": 0.10,
     "MIN_MAP_CENTER_COVERAGE": 0.035,
@@ -1406,6 +1407,27 @@ def build_zone_plan(
     return train_only_plan, split_plan
 
 
+def build_tier_center_ui_plan(
+    valid_centers: list[tuple[int, int]],
+    target_count: int,
+) -> list[tuple[tuple[int, int], tuple[int, int, int] | None]]:
+    """让每个 Tier 合法中心至少包含一次原尺寸中心图标簇。"""
+    count = max(
+        len(valid_centers),
+        round(target_count * CONFIG["TIER_CENTER_UI_EXTRA_RATIO"]),
+    )
+    centers = build_balanced_schedule(valid_centers, count)
+    zone_count = round(count * CONFIG["TIER_CENTER_UI_ZONE_RATIO"])
+    yellow_count = round(zone_count * CONFIG["UI_ZONE_YELLOW_PROB"])
+    colors = (
+        [ZONE_YELLOW_BGR] * yellow_count
+        + [ZONE_BLUE_BGR] * (zone_count - yellow_count)
+        + [None] * (count - zone_count)
+    )
+    random.shuffle(colors)
+    return list(zip(centers, colors))
+
+
 def load_error_images(
     class_name: str,
     error_dir: Path,
@@ -1644,10 +1666,10 @@ def generate_samples(
         target.append(sample)
 
     if light_aug:
-        center_ui_count = round(target_count * CONFIG["TIER_CENTER_UI_EXTRA_RATIO"])
-        center_ui_centers = build_balanced_schedule(valid_centers, center_ui_count)
-        center_ui_scales = build_scale_jitter_schedule(center_ui_count)
-        for (cx, cy), scale in zip(center_ui_centers, center_ui_scales):
+        for (cx, cy), fill_color in build_tier_center_ui_plan(
+            valid_centers,
+            target_count,
+        ):
             patch_bgr = compose_patch(
                 img,
                 cx,
@@ -1655,11 +1677,19 @@ def generate_samples(
                 0,
                 safe_size,
                 bg_paths,
-                scale,
+                1.0,
                 background_profile=background_profile,
                 tier_context=tier_context,
             )
-            sample = augment_patch_light(patch_bgr, UiClutter.TIER_CENTER)
+            sample = (
+                augment_patch_light(patch_bgr, UiClutter.TIER_CENTER)
+                if fill_color is None
+                else augment_zone_patch(
+                    patch_bgr,
+                    fill_color,
+                    UiClutter.TIER_CENTER,
+                )
+            )
             train_only_samples.append(finalize_positive_map_sample(sample))
 
     if random_sampling_only:
