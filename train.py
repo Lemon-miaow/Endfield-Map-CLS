@@ -2,11 +2,12 @@
 train.py — YOLO 分类器训练脚本
 
 支持两种启动模式：
-    auto（默认）  自动查找 runs/classify 下修改时间最新的 best.pt
+    auto（默认）  自动查找 runs/classify 下修改时间最新的 selected.pt / best.pt
                   作为增量微调起点；若不存在历史权重则从 yolo26s-cls.pt 底模开始训练。
     显式指定      通过 --model 传入具体 .pt 路径，强制使用该权重初始化。
 
-训练期间按最低 val/loss 保存 best.pt 和执行早停，使正确类别的置信度退化能够参与选优。
+训练期间按生成验证集与固定真实验证集的综合损失保存 best.pt 和执行早停，
+使真实场景中的正确类别置信度退化能够参与选优。
 
 用法:
     python train.py [--data <dir>] [--model <path|auto>]
@@ -23,6 +24,7 @@ from copy import copy
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from ultralytics import YOLO
 from ultralytics.models.yolo.classify import ClassificationTrainer, ClassificationValidator
 
@@ -47,12 +49,12 @@ DEFAULT_CONFIG = {
 
 
 class ValidationLossValidator(ClassificationValidator):
-    """使用验证损失选择对正确类别更有把握的检查点。"""
+    """使用生成验证集与固定真实验证集的综合损失选择检查点。"""
 
-    def _log_fixed_predictions(self, trainer) -> None:
-        """输出固定验证图的目标类别置信度与 top1。"""
+    def _evaluate_fixed_predictions(self, trainer) -> dict[str, float] | None:
+        """独立计算固定验证图损失，并输出每张图的目标类别置信度。"""
         if getattr(trainer, "rank", -1) not in {-1, 0}:
-            return
+            return None
 
         dataset = self.dataloader.dataset
         fixed_samples = [
@@ -61,7 +63,7 @@ class ValidationLossValidator(ClassificationValidator):
             if Path(path).name.startswith("fixed_")
         ]
         if not fixed_samples:
-            return
+            return None
 
         images = torch.stack([dataset[index]["img"] for index, *_ in fixed_samples])
         model = trainer.ema.ema or trainer.model
@@ -71,30 +73,62 @@ class ValidationLossValidator(ClassificationValidator):
         with torch.inference_mode():
             output = model(images.to(self.device).float())
             if isinstance(output, (tuple, list)):
-                output = output[0]
-            probabilities = output.softmax(1).cpu()
+                probabilities, logits = output
+            else:
+                logits = output
+                probabilities = logits.softmax(1)
+            targets = torch.tensor(
+                [target for _index, _path, target in fixed_samples],
+                device=logits.device,
+            )
+            losses = F.cross_entropy(logits, targets, reduction="none")
+            probabilities = probabilities.cpu()
 
-        for probability, (_index, _path, target) in zip(probabilities, fixed_samples):
+        for probability, (_index, path, target) in zip(probabilities, fixed_samples):
             predicted = int(probability.argmax())
             status = "OK" if predicted == target else "MISS"
             logger.info(
                 f"[Fixed Val][{trainer.epoch + 1}/{trainer.epochs}] "
-                f"{self.names[target]} {status}: "
+                f"{self.names[target]}/{Path(path).name} {status}: "
                 f"target={probability[target]:.2%}, "
                 f"top1={self.names[predicted]} {probability[predicted]:.2%}"
             )
 
+        top1_accuracy = float(
+            (probabilities.argmax(1) == targets.cpu()).float().mean()
+        )
+        return {
+            "loss": float(losses.mean()),
+            "worst_loss": float(losses.max()),
+            "top1_acc": top1_accuracy,
+        }
+
     def __call__(self, trainer=None, model=None):
         metrics = super().__call__(trainer, model)
-        if trainer is not None:
-            self._log_fixed_predictions(trainer)
-        if isinstance(metrics, dict) and "val/loss" in metrics:
-            metrics["fitness"] = 1.0 / (1.0 + metrics["val/loss"])
+        if not isinstance(metrics, dict) or "val/loss" not in metrics:
+            return metrics
+
+        fixed_metrics = (
+            self._evaluate_fixed_predictions(trainer)
+            if trainer is not None
+            else None
+        )
+        fixed_loss = 0.0
+        if fixed_metrics is not None:
+            fixed_loss = fixed_metrics["loss"]
+            metrics.update(
+                {
+                    f"fixed_val/{name}": round(value, 5)
+                    for name, value in fixed_metrics.items()
+                }
+            )
+
+        metrics["fitness"] = 1.0 / (1.0 + metrics["val/loss"] + fixed_loss)
         return metrics
 
 
 class ValidationLossTrainer(ClassificationTrainer):
-    """让 best.pt 和早停由最低验证损失决定。"""
+    """让 best.pt 和早停由最低综合验证损失决定。"""
 
     def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode="train"):
         loader = super().get_dataloader(
@@ -118,23 +152,30 @@ class ValidationLossTrainer(ClassificationTrainer):
 
 
 def find_latest_model(base_dir: str = "runs/classify") -> str | None:
-    """在训练输出目录中查找修改时间最新的 best.pt 权重文件。
+    """在训练输出目录中查找修改时间最新的候选权重。
 
     Args:
         base_dir: 训练结果根目录，默认为 runs/classify。
 
     Returns:
-        最新 best.pt 的字符串路径；目录不存在或无候选文件时返回 None。
+        最新 selected.pt 或 best.pt 的字符串路径；无候选文件时返回 None。
     """
     base_path = Path(base_dir)
     if not base_path.exists():
         return None
 
-    candidates = list(base_path.rglob("weights/best.pt"))
+    candidates = [
+        *base_path.rglob("weights/best.pt"),
+        *base_path.rglob("weights/selected.pt"),
+    ]
     if not candidates:
         return None
 
-    return str(max(candidates, key=lambda p: p.stat().st_mtime))
+    latest = max(
+        candidates,
+        key=lambda path: (path.stat().st_mtime_ns, path.name == "selected.pt"),
+    )
+    return str(latest)
 
 
 def train(args: argparse.Namespace) -> None:
