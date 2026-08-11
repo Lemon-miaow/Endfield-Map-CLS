@@ -81,7 +81,7 @@ python preprocess.py --map-export map_export.json
 * **环境仿真**：光度畸变、UI 遮挡仿真、中心角色标记位仿真。  
 * **玩家指针**：所有地图正样本始终叠加中心玩家指针，普通图标与路线独立随机出现。
 * **任务圈增强**：普通类别默认保留 1200 张基础样本并额外生成 600 张黄色/浅蓝色圈样本；在默认 Base tile 配置下，train 中每个有效中心至少保留一组同位置普通/黄色圈样本。
-* **背景域泛化**：从 bg_images/ 中随机提取复杂纹理，替换地图边界之外的背景，大幅提升模型抗 UI 遮挡能力。  
+* **背景域泛化**：自动生成暗到亮、不同色调的连续场景纹理，模拟游戏画面从半透明小地图中透出。
 * **集划分**：生成样本按 8:2 划分 train/val，人工困难样本只进入 train。
 
 ### **3.困难样本挖掘 (Active Learning)**
@@ -163,7 +163,6 @@ Endfield-Map-CLS/
 ├── 📁 source_images/        # [Input] 基础素材集 (需自行准备)  
 ├── 📁 error_images/         # [Input] 困难样本池 (Active Learning)  
 ├── 📁 validation_images/    # [Input] 可提交的固定真实验证集
-├── 📁 bg_images/            # [Input] 背景域随机化素材池  
 │  
 ├── 📁 dataset/              # [Temp] 编译生成的训练集  
 └── 📁 runs/                 # [Output] 训练日志与权重产物  

@@ -64,6 +64,7 @@ CONFIG = {
     "OCCLUSION_SIZE": 0,               # 保留兼容字段
     "ERROR_OVERSAMPLE": 5,             # 困难样本过采样倍数
     "ERROR_MIN_RATIO": 0.05,           # 困难样本至少占该类生成样本的比例
+    "BACKGROUND_RANDOM_PROB": 0.50,    # 透明地图后混入随机场景的样本比例
     "BACKGROUND_BLEND_RANGE": (0.9, 1.0),
     "BASE_CLASS_NAMES": {"Map01Base", "Map02Base"},
     "TILE_SIZE": 160,
@@ -1200,13 +1201,70 @@ def augment_zone_patch(
 # 背景合成
 # ---------------------------------------------------------------------------
 
+def build_random_scene_background(height: int, width: int) -> np.ndarray:
+    """生成暗到亮、低频为主的连续场景纹理。"""
+    coarse_size = random.randint(3, 10)
+    coarse = np.random.randint(
+        0,
+        256,
+        (coarse_size, coarse_size, 3),
+        dtype=np.uint8,
+    )
+    background = cv2.resize(
+        coarse,
+        (width, height),
+        interpolation=cv2.INTER_CUBIC,
+    ).astype(np.float32)
+
+    detail_size = random.randint(12, 24)
+    detail = np.random.randint(
+        0,
+        256,
+        (detail_size, detail_size, 3),
+        dtype=np.uint8,
+    )
+    detail = cv2.resize(
+        detail,
+        (width, height),
+        interpolation=cv2.INTER_LINEAR,
+    ).astype(np.float32)
+    background = background * 0.75 + detail * 0.25
+
+    gray = cv2.cvtColor(
+        np.clip(background, 0, 255).astype(np.uint8),
+        cv2.COLOR_BGR2GRAY,
+    )[..., None].astype(np.float32)
+    saturation = random.uniform(0.05, 1.00)
+    background = gray + (background - gray) * saturation
+    target_mean = random.uniform(5, 230)
+    contrast = random.uniform(0.35, 1.35)
+    background = (background - background.mean()) * contrast + target_mean
+    return np.clip(background, 0, 255)
+
+
 def apply_background_composition(
     patch_bgra: np.ndarray,
     bg_paths: list,
     profile: BackgroundProfile = BackgroundProfile.STANDARD,
 ) -> np.ndarray:
-    """将地图透明区域合成到游戏小地图使用的黑底上。"""
-    return premultiply_to_bgr(patch_bgra)
+    """合成半透明小地图，覆盖游戏场景从透明区透出的情况。"""
+    if patch_bgra.shape[2] != 4:
+        return patch_bgra.copy()
+
+    foreground = patch_bgra[..., :3].astype(np.float32)
+    alpha = patch_bgra[..., 3].astype(np.float32)[..., None] / 255.0
+    if (
+        profile == BackgroundProfile.TIER
+        or random.random() >= CONFIG["BACKGROUND_RANDOM_PROB"]
+    ):
+        background = np.zeros_like(foreground)
+    else:
+        height, width = patch_bgra.shape[:2]
+        background = build_random_scene_background(height, width)
+
+    blend = random.uniform(*CONFIG["BACKGROUND_BLEND_RANGE"])
+    result = foreground * alpha + background * (1.0 - alpha) * blend
+    return np.clip(result, 0, 255).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------

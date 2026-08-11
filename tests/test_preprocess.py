@@ -337,16 +337,35 @@ class TierSamplingTests(unittest.TestCase):
             )
         )
 
-    def test_positive_map_background_is_always_black(self) -> None:
+    def test_background_composition_preserves_black_baseline_and_tier(self) -> None:
         image = np.zeros((32, 32, 4), dtype=np.uint8)
         image[8:24, 8:24] = (30, 60, 90, 255)
 
-        standard = apply_background_composition(image, [Path("unused.png")])
-        tier = apply_background_composition(image, [], BackgroundProfile.TIER)
+        with patch("preprocess.random.random", return_value=1.0):
+            standard = apply_background_composition(image, [])
+        with patch("preprocess.random.random", return_value=0.0):
+            tier = apply_background_composition(image, [], BackgroundProfile.TIER)
 
         for result in (standard, tier):
             self.assertTupleEqual(tuple(result[0, 0]), (0, 0, 0))
             self.assertTupleEqual(tuple(result[16, 16]), (30, 60, 90))
+
+    def test_standard_background_covers_full_scene_brightness_range(self) -> None:
+        image = np.zeros((64, 64, 4), dtype=np.uint8)
+        image[24:40, 24:40] = (30, 60, 90, 255)
+
+        with (
+            patch("preprocess.random.random", return_value=0.0),
+            patch(
+                "preprocess.build_random_scene_background",
+                return_value=np.full((64, 64, 3), 200, dtype=np.float32),
+            ),
+            patch("preprocess.random.uniform", return_value=1.0),
+        ):
+            result = apply_background_composition(image, [])
+
+        self.assertTupleEqual(tuple(result[0, 0]), (200, 200, 200))
+        self.assertTupleEqual(tuple(result[32, 32]), (30, 60, 90))
 
     def test_low_signal_base_centers_never_receive_ui_or_zones(self) -> None:
         safe_size = 182
