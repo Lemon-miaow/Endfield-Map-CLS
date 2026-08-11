@@ -66,7 +66,12 @@ class ValidationSelectionTests(unittest.TestCase):
         )
         self.assertAlmostEqual(metrics["loss"], float(expected_loss))
         self.assertEqual(metrics["top1_acc"], 1.0)
-        self.assertIn("target=90.00%", logs.output[0])
+        output = "\n".join(logs.output)
+        self.assertIn("[Fixed Val][1/1] 1/1 OK", output)
+        self.assertIn("TOP2", output)
+        self.assertIn("90.00%", output)
+        self.assertIn("wrong", output)
+        self.assertIn("80.00pp", output)
 
     def test_fixed_loss_has_full_weight_in_checkpoint_fitness(self) -> None:
         validator = object.__new__(ValidationLossValidator)

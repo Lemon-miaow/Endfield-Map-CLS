@@ -85,15 +85,44 @@ class ValidationLossValidator(ClassificationValidator):
             losses = F.cross_entropy(logits, targets, reduction="none")
             probabilities = probabilities.cpu()
 
+        rows = []
         for probability, (_index, path, target) in zip(probabilities, fixed_samples):
-            predicted = int(probability.argmax())
+            top_probabilities, top_indices = probability.topk(2)
+            predicted, runner_up = map(int, top_indices)
             status = "OK" if predicted == target else "MISS"
-            logger.info(
-                f"[Fixed Val][{trainer.epoch + 1}/{trainer.epochs}] "
-                f"{self.names[target]}/{Path(path).name} {status}: "
-                f"target={probability[target]:.2%}, "
-                f"top1={self.names[predicted]} {probability[predicted]:.2%}"
+            rows.append(
+                (
+                    status,
+                    self.names[target],
+                    Path(path).stem.removeprefix("fixed_"),
+                    f"{probability[target]:.2%}",
+                    self.names[predicted],
+                    f"{top_probabilities[0]:.2%}",
+                    self.names[runner_up],
+                    f"{top_probabilities[1]:.2%}",
+                    f"{(top_probabilities[0] - top_probabilities[1]) * 100:.2f}pp",
+                )
             )
+
+        headers = ("ST", "TARGET", "SAMPLE", "P(T)", "TOP1", "P1", "TOP2", "P2", "GAP")
+        widths = [max(map(len, column)) for column in zip(headers, *rows)]
+        numeric_columns = {3, 5, 7, 8}
+
+        def format_row(row: tuple[str, ...]) -> str:
+            return "  ".join(
+                f"{value:>{width}}" if index in numeric_columns else f"{value:<{width}}"
+                for index, (value, width) in enumerate(zip(row, widths))
+            )
+
+        correct_count = sum(row[0] == "OK" for row in rows)
+        logger.info(
+            f"[Fixed Val][{trainer.epoch + 1}/{trainer.epochs}] "
+            f"{correct_count}/{len(rows)} OK"
+        )
+        logger.info(format_row(headers))
+        logger.info("  ".join("-" * width for width in widths))
+        for row in rows:
+            logger.info(format_row(row))
 
         top1_accuracy = float(
             (probabilities.argmax(1) == targets.cpu()).float().mean()
