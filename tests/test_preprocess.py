@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 
 from preprocess import (
-    BackgroundProfile,
+    BackgroundKind,
     CONFIG,
     UI_BLUE_BGR,
     UiClutter,
@@ -24,7 +24,10 @@ from preprocess import (
     add_extreme_icon_clutter,
     add_tier_center_icon_cluster,
     apply_background_composition,
+    build_background_schedule,
     build_balanced_schedule,
+    build_counterfactual_background_schedule,
+    build_random_scene_background,
     build_scale_jitter_schedule,
     build_tier_center_mask,
     build_tier_center_ui_plan,
@@ -32,6 +35,7 @@ from preprocess import (
     build_zone_plan,
     build_zone_ui_clutter_schedule,
     copy_fixed_validation_samples,
+    compose_tier_context_patch,
     draw_random_ui_lines,
     finalize_positive_map_sample,
     generate_samples,
@@ -265,7 +269,7 @@ class UiCompositionTests(unittest.TestCase):
 
         self.assertGreater(np.count_nonzero(pointer_region), 0)
 
-    def test_base_keeps_one_clean_anchor_pass_before_ui_augmentation(self) -> None:
+    def test_base_keeps_two_counterfactual_passes_before_ui_augmentation(self) -> None:
         safe_size = 182
         pad = safe_size // 2
         size = 256
@@ -282,16 +286,36 @@ class UiCompositionTests(unittest.TestCase):
         image[pad : pad + size, pad : pad + size, :3] = texture
         image[pad : pad + size, pad : pad + size, 3] = 255
 
-        with patch("preprocess.augment_patch", side_effect=lambda patch, *_: patch) as augment:
+        with (
+            patch.dict(CONFIG, {"UI_ZONE_EXTRA_RATIO": 0.0}),
+            patch(
+                "preprocess.augment_patch",
+                side_effect=lambda patch, *_: patch,
+            ) as augment,
+            patch(
+                "preprocess.apply_background_composition",
+                wraps=apply_background_composition,
+            ) as compose,
+        ):
             generate_samples(
                 image,
                 safe_size,
                 [],
                 sample_region=(96, 96, 64, 64),
-                target_count=96,
+                target_count=192,
             )
 
-        self.assertEqual(augment.call_count, 32)
+        self.assertEqual(augment.call_count, 64)
+        self.assertEqual(
+            Counter(call.args[2] for call in compose.call_args_list),
+            Counter(
+                {
+                    BackgroundKind.BLACK: 64,
+                    BackgroundKind.TEXTURE: 64,
+                    BackgroundKind.STRUCTURED: 64,
+                }
+            ),
+        )
 
 
 class TierSamplingTests(unittest.TestCase):
@@ -337,35 +361,121 @@ class TierSamplingTests(unittest.TestCase):
             )
         )
 
-    def test_background_composition_preserves_black_baseline_and_tier(self) -> None:
+    def test_background_composition_preserves_black_baseline(self) -> None:
         image = np.zeros((32, 32, 4), dtype=np.uint8)
         image[8:24, 8:24] = (30, 60, 90, 255)
 
-        with patch("preprocess.random.random", return_value=1.0):
-            standard = apply_background_composition(image, [])
-        with patch("preprocess.random.random", return_value=0.0):
-            tier = apply_background_composition(image, [], BackgroundProfile.TIER)
+        result = apply_background_composition(
+            image,
+            [],
+            BackgroundKind.BLACK,
+        )
 
-        for result in (standard, tier):
-            self.assertTupleEqual(tuple(result[0, 0]), (0, 0, 0))
-            self.assertTupleEqual(tuple(result[16, 16]), (30, 60, 90))
+        self.assertTupleEqual(tuple(result[0, 0]), (0, 0, 0))
+        self.assertTupleEqual(tuple(result[16, 16]), (30, 60, 90))
 
-    def test_standard_background_covers_full_scene_brightness_range(self) -> None:
+    def test_texture_background_covers_full_scene_brightness_range(self) -> None:
         image = np.zeros((64, 64, 4), dtype=np.uint8)
         image[24:40, 24:40] = (30, 60, 90, 255)
 
         with (
-            patch("preprocess.random.random", return_value=0.0),
             patch(
                 "preprocess.build_random_scene_background",
-                return_value=np.full((64, 64, 3), 200, dtype=np.float32),
-            ),
-            patch("preprocess.random.uniform", return_value=1.0),
+                return_value=np.full((64, 64, 3), 200, dtype=np.uint8),
+            ) as generate_background,
         ):
-            result = apply_background_composition(image, [])
+            result = apply_background_composition(
+                image,
+                [],
+                BackgroundKind.TEXTURE,
+                seed=7,
+            )
 
         self.assertTupleEqual(tuple(result[0, 0]), (200, 200, 200))
         self.assertTupleEqual(tuple(result[32, 32]), (30, 60, 90))
+        generate_background.assert_called_once_with(
+            64,
+            64,
+            BackgroundKind.TEXTURE,
+            7,
+            [],
+        )
+
+    def test_counterfactual_schedule_covers_three_backgrounds_per_center(self) -> None:
+        centers = [(0, 0), (1, 0)] * 3
+
+        schedule = build_counterfactual_background_schedule(
+            centers,
+            anchor_count=2,
+        )
+        kinds_by_center = {
+            center: [
+                kind
+                for scheduled_center, (kind, _seed) in zip(centers, schedule)
+                if scheduled_center == center
+            ]
+            for center in set(centers)
+        }
+
+        self.assertEqual(
+            set(kinds_by_center[(0, 0)]),
+            set(BackgroundKind),
+        )
+        self.assertEqual(
+            set(kinds_by_center[(1, 0)]),
+            set(BackgroundKind),
+        )
+
+    def test_background_schedule_is_balanced_and_reuses_seeds(self) -> None:
+        first = build_background_schedule(10, stream=3)
+        second = build_background_schedule(10, stream=3)
+        next_run = build_background_schedule(10, stream=3, run_seed=1)
+        counts = Counter(kind for kind, _seed in first)
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, next_run)
+        self.assertLessEqual(max(counts.values()) - min(counts.values()), 1)
+
+    def test_procedural_background_is_repeatable_and_contains_fine_detail(self) -> None:
+        texture = build_random_scene_background(
+            128,
+            128,
+            BackgroundKind.TEXTURE,
+            seed=7,
+        )
+        repeated = build_random_scene_background(
+            128,
+            128,
+            BackgroundKind.TEXTURE,
+            seed=7,
+        )
+        structured = build_random_scene_background(
+            128,
+            128,
+            BackgroundKind.STRUCTURED,
+            seed=7,
+        )
+
+        self.assertTrue(np.array_equal(texture, repeated))
+        self.assertGreater(float(cv2.Laplacian(texture, cv2.CV_32F).std()), 2.0)
+        self.assertFalse(np.array_equal(texture, structured))
+
+    def test_tier_context_keeps_parent_transparency_for_scene_background(self) -> None:
+        tier = np.zeros((32, 32, 4), dtype=np.uint8)
+        tier[12:20, 12:20] = (240, 240, 240, 255)
+        parent = np.full((32, 32, 4), (100, 100, 100, 255), dtype=np.uint8)
+
+        layer = compose_tier_context_patch(tier, parent, mask_mode="bright")
+        result = apply_background_composition(
+            layer,
+            [],
+            BackgroundKind.TEXTURE,
+            seed=7,
+        )
+
+        self.assertLess(int(layer[0, 0, 3]), 255)
+        self.assertTupleEqual(tuple(layer[16, 16]), (240, 240, 240, 255))
+        self.assertGreater(int(result[0, 0].mean()), 20)
 
     def test_low_signal_base_centers_never_receive_ui_or_zones(self) -> None:
         safe_size = 182
@@ -390,11 +500,11 @@ class TierSamplingTests(unittest.TestCase):
                 safe_size,
                 [],
                 sample_region=(96, 96, 64, 64),
-                target_count=96,
+                target_count=192,
             )
 
-        self.assertEqual(len(samples), 32)
-        self.assertEqual(len(train_only_samples), 64)
+        self.assertEqual(len(samples), 64)
+        self.assertEqual(len(train_only_samples), 128)
         augment.assert_not_called()
         augment_zone.assert_not_called()
 
@@ -449,7 +559,7 @@ class TierSamplingTests(unittest.TestCase):
         image[pad : pad + size, pad : pad + size, :3] = texture
         image[pad : pad + size, pad : pad + size, 3] = 255
         tier_context = {
-            "parent_aligned": np.zeros(image.shape[:2] + (3,), dtype=np.uint8),
+            "parent_aligned": np.zeros(image.shape, dtype=np.uint8),
             "mask_mode": "opaque",
         }
 

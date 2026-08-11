@@ -58,7 +58,7 @@ class MapExportContractTests(unittest.TestCase):
             self.assertEqual(specs["Map02Lv002Tier255"]["parent_size"], (16, 16))
             self.assertEqual(specs["Map02Lv002Tier255"]["template_size"], (8, 8))
 
-    def test_tier_context_preserves_parent_pixels_outside_foreground(self) -> None:
+    def test_tier_context_preserves_parent_as_transparent_layer(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             parent = np.zeros((64, 64, 4), dtype=np.uint8)
@@ -90,12 +90,17 @@ class MapExportContractTests(unittest.TestCase):
 
             self.assertGreater(int(output[center + 8, center + 8].sum()), 0)
             self.assertGreater(int(output[center + 16, center + 16].sum()), 0)
-            np.testing.assert_array_equal(
-                output[center + 20, center + 20],
-                (
-                    context["parent_aligned"][center + 20, center + 20]
-                    * CONFIG["TIER_PARENT_INTENSITY"]
-                ).astype(np.uint8),
+            parent_pixel = context["parent_aligned"][center + 20, center + 20]
+            output_pixel = output[center + 20, center + 20]
+            np.testing.assert_allclose(
+                output_pixel[:3],
+                parent_pixel[:3],
+                atol=1,
+            )
+            self.assertAlmostEqual(
+                int(output_pixel[3]),
+                round(255 * CONFIG["TIER_PARENT_INTENSITY"]),
+                delta=1,
             )
 
 

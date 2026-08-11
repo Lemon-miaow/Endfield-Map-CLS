@@ -35,6 +35,7 @@ import os
 import random
 import shutil
 from enum import IntEnum
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
@@ -64,8 +65,7 @@ CONFIG = {
     "OCCLUSION_SIZE": 0,               # 保留兼容字段
     "ERROR_OVERSAMPLE": 5,             # 困难样本过采样倍数
     "ERROR_MIN_RATIO": 0.05,           # 困难样本至少占该类生成样本的比例
-    "BACKGROUND_RANDOM_PROB": 0.50,    # 透明地图后混入随机场景的样本比例
-    "BACKGROUND_BLEND_RANGE": (0.9, 1.0),
+    "BACKGROUND_CLEAN_PASSES": 2,      # 每个 Base 中心保留黑底与纹理底同构样本
     "BASE_CLASS_NAMES": {"Map01Base", "Map02Base"},
     "TILE_SIZE": 160,
     "TILE_STRIDE": 160,
@@ -129,9 +129,10 @@ class UiClutter(IntEnum):
     TIER_CENTER = 3
 
 
-class BackgroundProfile(IntEnum):
-    STANDARD = 0
-    TIER = 1
+class BackgroundKind(IntEnum):
+    BLACK = 0
+    TEXTURE = 1
+    STRUCTURED = 2
 
 
 DEFAULT_OPTIONS = {
@@ -894,16 +895,6 @@ def load_image(path: Path, safe_size: int) -> np.ndarray:
     )
 
 
-def premultiply_to_bgr(img: np.ndarray) -> np.ndarray:
-    """Convert an RGB/RGBA image to BGR, honoring transparent pixels."""
-    if img.ndim == 2:
-        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    if img.shape[2] == 3:
-        return img.copy()
-    alpha = img[..., 3].astype(np.float32)[..., None] / 255.0
-    return (img[..., :3].astype(np.float32) * alpha).astype(np.uint8)
-
-
 def build_tier_parent_context(
     template_img: np.ndarray,
     tier_spec: dict,
@@ -923,7 +914,10 @@ def build_tier_parent_context(
             f"path={parent_path}"
         )
 
-    parent_bgr = premultiply_to_bgr(parent)
+    if parent.ndim == 2:
+        parent = cv2.cvtColor(parent, cv2.COLOR_GRAY2BGRA)
+    elif parent.shape[2] == 3:
+        parent = cv2.cvtColor(parent, cv2.COLOR_BGR2BGRA)
     height, width = template_img.shape[:2]
     pad = safe_size // 2
     x, y = np.meshgrid(
@@ -932,12 +926,12 @@ def build_tier_parent_context(
     )
     sx, tx, sy, ty = tier_spec["affine"]
     parent_aligned = cv2.remap(
-        parent_bgr,
+        parent,
         sx * x + tx,
         sy * y + ty,
         cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 0, 0),
+        borderValue=(0, 0, 0, 0),
     )
     return {
         "parent_aligned": parent_aligned,
@@ -947,13 +941,20 @@ def build_tier_parent_context(
 
 def compose_tier_context_patch(
     tier_patch_bgra: np.ndarray,
-    parent_patch_bgr: np.ndarray,
+    parent_patch_bgra: np.ndarray,
     mask_mode: str = "opaque",
 ) -> np.ndarray:
-    """Overlay the Tier foreground on the complete parent-map context."""
-    tier_bgr = premultiply_to_bgr(tier_patch_bgra).astype(np.float32)
+    """将 Tier 前景叠到半透明 Base 上，同时保留场景背景入口。"""
+    if parent_patch_bgra.shape[2] == 3:
+        parent_patch_bgra = cv2.cvtColor(parent_patch_bgra, cv2.COLOR_BGR2BGRA)
+
+    tier_rgb = tier_patch_bgra[..., :3].astype(np.float32)
     alpha = tier_patch_bgra[..., 3].astype(np.float32) / 255.0
-    gray = cv2.cvtColor(tier_bgr.astype(np.uint8), cv2.COLOR_BGR2GRAY)
+    tier_visible = tier_rgb * alpha[..., None]
+    gray = cv2.cvtColor(
+        np.clip(tier_visible, 0, 255).astype(np.uint8),
+        cv2.COLOR_BGR2GRAY,
+    )
     if mask_mode == "bright":
         foreground = (alpha > 10 / 255.0) & (gray > 18)
     else:
@@ -978,12 +979,32 @@ def compose_tier_context_patch(
             )
             border_dark = np.isin(labels, border_labels) & (labels > 0)
             foreground = opaque & ~border_dark
-    foreground_alpha = alpha * foreground.astype(np.float32)
-    parent = parent_patch_bgr.astype(np.float32) * CONFIG["TIER_PARENT_INTENSITY"]
-    result = tier_bgr * foreground_alpha[..., None] + parent * (
-        1.0 - foreground_alpha[..., None]
+    tier_alpha = alpha * foreground.astype(np.float32)
+    parent_rgb = parent_patch_bgra[..., :3].astype(np.float32)
+    parent_alpha = (
+        parent_patch_bgra[..., 3].astype(np.float32)
+        / 255.0
+        * CONFIG["TIER_PARENT_INTENSITY"]
     )
-    return np.clip(result, 0, 255).astype(np.uint8)
+    output_alpha = tier_alpha + parent_alpha * (1.0 - tier_alpha)
+    output_premultiplied = (
+        tier_rgb * tier_alpha[..., None]
+        + parent_rgb
+        * parent_alpha[..., None]
+        * (1.0 - tier_alpha[..., None])
+    )
+    output_rgb = np.divide(
+        output_premultiplied,
+        output_alpha[..., None],
+        out=np.zeros_like(output_premultiplied),
+        where=output_alpha[..., None] > 1e-6,
+    )
+    return np.dstack(
+        (
+            np.clip(output_rgb, 0, 255).astype(np.uint8),
+            np.clip(output_alpha * 255, 0, 255).astype(np.uint8),
+        )
+    )
 
 
 def extract_roi(
@@ -1201,69 +1222,240 @@ def augment_zone_patch(
 # 背景合成
 # ---------------------------------------------------------------------------
 
-def build_random_scene_background(height: int, width: int) -> np.ndarray:
-    """生成暗到亮、低频为主的连续场景纹理。"""
-    coarse_size = random.randint(3, 10)
-    coarse = np.random.randint(
-        0,
-        256,
-        (coarse_size, coarse_size, 3),
-        dtype=np.uint8,
-    )
-    background = cv2.resize(
-        coarse,
-        (width, height),
-        interpolation=cv2.INTER_CUBIC,
-    ).astype(np.float32)
+def _background_seed(
+    index: int,
+    stream: int = 0,
+    run_seed: int = 0,
+) -> int:
+    """为所有类别复用同一组背景种子，阻断背景与标签的统计关联。"""
+    return (
+        0x9E3779B97F4A7C15 * (index + 1)
+        + 0xBF58476D1CE4E5B9 * (stream + 1)
+        + 0x94D049BB133111EB * run_seed
+    ) & ((1 << 64) - 1)
 
-    detail_size = random.randint(12, 24)
-    detail = np.random.randint(
-        0,
-        256,
-        (detail_size, detail_size, 3),
-        dtype=np.uint8,
+
+def build_background_schedule(
+    sample_count: int,
+    stream: int = 0,
+    run_seed: int = 0,
+) -> list[tuple[BackgroundKind, int]]:
+    """以固定均衡配额生成黑底、自然纹理和结构纹理背景。"""
+    kinds = tuple(BackgroundKind)
+    return [
+        (
+            kinds[index % len(kinds)],
+            _background_seed(index, stream, run_seed),
+        )
+        for index in range(sample_count)
+    ]
+
+
+def build_counterfactual_background_schedule(
+    centers: list[tuple[int, int]],
+    anchor_count: int = 0,
+    stream: int = 0,
+    run_seed: int = 0,
+) -> list[tuple[BackgroundKind, int]]:
+    """让同一 Base 中心依次看到黑底、纹理底和结构底。"""
+    if not anchor_count:
+        return build_background_schedule(len(centers), stream, run_seed)
+
+    occurrences: dict[tuple[int, int], int] = {}
+    schedule = []
+    kinds = tuple(BackgroundKind)
+    for index, center in enumerate(centers):
+        occurrence = occurrences.get(center, 0)
+        kind = BackgroundKind.BLACK if index < anchor_count else kinds[occurrence % 3]
+        schedule.append((kind, _background_seed(index, stream, run_seed)))
+        occurrences[center] = occurrence + 1
+    return schedule
+
+
+def _multiscale_noise(
+    height: int,
+    width: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """生成同时含大轮廓与细节的连续三通道噪声。"""
+    result = np.zeros((height, width, 3), dtype=np.float32)
+    levels = (
+        (rng.integers(2, 5), 0.38),
+        (rng.integers(6, 12), 0.28),
+        (rng.integers(16, 30), 0.20),
+        (rng.integers(48, 80), 0.14),
     )
-    detail = cv2.resize(
-        detail,
-        (width, height),
-        interpolation=cv2.INTER_LINEAR,
-    ).astype(np.float32)
-    background = background * 0.75 + detail * 0.25
+    for size, weight in levels:
+        noise = rng.normal(127.5, 52.0, (int(size), int(size), 3)).astype(
+            np.float32
+        )
+        result += cv2.resize(noise, (width, height), interpolation=cv2.INTER_CUBIC) * weight
+    return result
+
+
+def _add_scene_structures(
+    background: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """加入接近岩壁、植被和建筑边缘的反走样结构。"""
+    height, width = background.shape[:2]
+    structures = np.zeros_like(background, dtype=np.uint8)
+    for _ in range(int(rng.integers(3, 8))):
+        points = rng.integers(
+            (-width // 4, -height // 4),
+            (width * 5 // 4, height * 5 // 4),
+            size=(int(rng.integers(3, 7)), 2),
+        ).astype(np.int32)
+        color = tuple(int(value) for value in rng.integers(15, 241, size=3))
+        cv2.fillConvexPoly(structures, cv2.convexHull(points), color, cv2.LINE_AA)
+
+    mixed = cv2.addWeighted(
+        np.clip(background, 0, 255).astype(np.uint8),
+        float(rng.uniform(0.55, 0.82)),
+        structures,
+        float(rng.uniform(0.18, 0.45)),
+        0,
+    )
+    for _ in range(int(rng.integers(5, 15))):
+        start = (
+            int(rng.integers(-32, width + 32)),
+            int(rng.integers(-32, height + 32)),
+        )
+        end = (
+            int(rng.integers(-32, width + 32)),
+            int(rng.integers(-32, height + 32)),
+        )
+        color = tuple(int(value) for value in rng.integers(5, 251, size=3))
+        cv2.line(
+            mixed,
+            start,
+            end,
+            color,
+            int(rng.integers(1, 9)),
+            cv2.LINE_AA,
+        )
+    return mixed.astype(np.float32)
+
+
+@lru_cache(maxsize=8)
+def _load_distractor_image(path: str) -> np.ndarray | None:
+    """按进程缓存少量模板，避免结构背景反复读取大图。"""
+    return safe_imread(path, cv2.IMREAD_UNCHANGED)
+
+
+def _add_map_distractor(
+    background: np.ndarray,
+    bg_paths: list,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """把随机地图碎片放进透明区，直接打断跨类别背景捷径。"""
+    if not bg_paths:
+        return background
+
+    path = str(bg_paths[int(rng.integers(0, len(bg_paths)))])
+    source = _load_distractor_image(path)
+    if source is None:
+        return background
+    if source.ndim == 2:
+        source = cv2.cvtColor(source, cv2.COLOR_GRAY2BGRA)
+    elif source.shape[2] == 3:
+        source = cv2.cvtColor(source, cv2.COLOR_BGR2BGRA)
+
+    height, width = background.shape[:2]
+    source_height, source_width = source.shape[:2]
+    max_side = min(source_height, source_width)
+    if max_side <= 0:
+        return background
+
+    crop_side = min(
+        max_side,
+        max(
+            min(height, width),
+            int(max(height, width) * rng.uniform(1.0, 4.0)),
+        ),
+    )
+    candidates = []
+    for _ in range(4):
+        x = int(rng.integers(0, max(1, source_width - crop_side + 1)))
+        y = int(rng.integers(0, max(1, source_height - crop_side + 1)))
+        crop = source[y : y + crop_side, x : x + crop_side]
+        score = np.count_nonzero(crop[..., 3] > 10)
+        candidates.append((score, crop))
+    crop = max(candidates, key=lambda item: item[0])[1]
+    crop = cv2.resize(crop, (width, height), interpolation=cv2.INTER_AREA)
+    crop = np.rot90(crop, int(rng.integers(0, 4))).copy()
+    if rng.random() < 0.5:
+        crop = cv2.flip(crop, 1)
+    if crop.shape[:2] != (height, width):
+        crop = cv2.resize(crop, (width, height), interpolation=cv2.INTER_AREA)
+
+    alpha = crop[..., 3].astype(np.float32)[..., None] / 255.0
+    distractor = crop[..., :3].astype(np.float32)
+    strength = float(rng.uniform(0.45, 0.85))
+    return (
+        distractor * alpha * strength
+        + background * (1.0 - alpha * strength)
+    )
+
+
+def build_random_scene_background(
+    height: int,
+    width: int,
+    kind: BackgroundKind = BackgroundKind.TEXTURE,
+    seed: int | None = None,
+    bg_paths: list | None = None,
+) -> np.ndarray:
+    """程序化生成跨亮度、颜色、频率和结构的游戏场景背景。"""
+    rng = np.random.default_rng(seed)
+    background = _multiscale_noise(height, width, rng)
+    if kind == BackgroundKind.STRUCTURED:
+        background = _add_scene_structures(background, rng)
+        background = _add_map_distractor(background, bg_paths or [], rng)
 
     gray = cv2.cvtColor(
         np.clip(background, 0, 255).astype(np.uint8),
         cv2.COLOR_BGR2GRAY,
     )[..., None].astype(np.float32)
-    saturation = random.uniform(0.05, 1.00)
+    saturation = float(rng.uniform(0.0, 1.15))
     background = gray + (background - gray) * saturation
-    target_mean = random.uniform(5, 230)
-    contrast = random.uniform(0.35, 1.35)
+    contrast = float(rng.uniform(0.45, 1.75))
+    target_mean = float(rng.uniform(4, 244))
     background = (background - background.mean()) * contrast + target_mean
-    return np.clip(background, 0, 255)
+
+    if rng.random() < 0.35:
+        sigma = float(rng.uniform(0.35, 1.8))
+        background = cv2.GaussianBlur(background, (0, 0), sigma)
+    elif rng.random() < 0.45:
+        blurred = cv2.GaussianBlur(background, (0, 0), 1.0)
+        background = cv2.addWeighted(background, 1.7, blurred, -0.7, 0)
+    return np.clip(background, 0, 255).astype(np.uint8)
 
 
 def apply_background_composition(
     patch_bgra: np.ndarray,
     bg_paths: list,
-    profile: BackgroundProfile = BackgroundProfile.STANDARD,
+    kind: BackgroundKind = BackgroundKind.BLACK,
+    seed: int | None = None,
 ) -> np.ndarray:
-    """合成半透明小地图，覆盖游戏场景从透明区透出的情况。"""
+    """把 Base/Tier 小地图以相同规则叠到程序化游戏场景上。"""
     if patch_bgra.shape[2] != 4:
         return patch_bgra.copy()
 
     foreground = patch_bgra[..., :3].astype(np.float32)
     alpha = patch_bgra[..., 3].astype(np.float32)[..., None] / 255.0
-    if (
-        profile == BackgroundProfile.TIER
-        or random.random() >= CONFIG["BACKGROUND_RANDOM_PROB"]
-    ):
+    if kind == BackgroundKind.BLACK:
         background = np.zeros_like(foreground)
     else:
         height, width = patch_bgra.shape[:2]
-        background = build_random_scene_background(height, width)
+        background = build_random_scene_background(
+            height,
+            width,
+            kind,
+            seed,
+            bg_paths,
+        )
 
-    blend = random.uniform(*CONFIG["BACKGROUND_BLEND_RANGE"])
-    result = foreground * alpha + background * (1.0 - alpha) * blend
+    result = foreground * alpha + background * (1.0 - alpha)
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
@@ -1280,7 +1472,8 @@ def compose_patch(
     safe_size: int,
     bg_paths: list,
     scale: float = 1.0,
-    background_profile: BackgroundProfile = BackgroundProfile.STANDARD,
+    background_kind: BackgroundKind = BackgroundKind.BLACK,
+    background_seed: int | None = None,
     tier_context: dict | None = None,
 ) -> np.ndarray:
     """提取图块并合成背景。"""
@@ -1294,12 +1487,17 @@ def compose_patch(
             safe_size,
             scale,
         )
-        return compose_tier_context_patch(
+        patch_bgra = compose_tier_context_patch(
             patch_bgra,
             parent_patch,
             tier_context["mask_mode"],
         )
-    return apply_background_composition(patch_bgra, bg_paths, background_profile)
+    return apply_background_composition(
+        patch_bgra,
+        bg_paths,
+        background_kind,
+        background_seed,
+    )
 
 
 def build_tier_center_mask(
@@ -1507,6 +1705,7 @@ def generate_samples(
     light_aug: bool = False,
     random_sampling_only: bool = False,
     tier_context: dict | None = None,
+    background_run_seed: int = 0,
 ) -> tuple[list, list]:
     """生成 TARGET_COUNT 个基础样本，并为地图类追加区域圈干扰样本。
 
@@ -1544,9 +1743,6 @@ def generate_samples(
         else None
     )
     center_mask = tier_center_mask if tier_center_mask is not None else base_center_mask
-    background_profile = (
-        BackgroundProfile.TIER if light_aug else BackgroundProfile.STANDARD
-    )
     min_map_circle_coverage = (
         CONFIG["TIER_MIN_MAP_CIRCLE_COVERAGE"]
         if light_aug
@@ -1603,6 +1799,7 @@ def generate_samples(
     samples = []
     train_only_samples = []
     augmentation_centers = valid_centers
+    anchor_count = 0
     if sample_region is not None:
         augmentation_centers = [
             (cx, cy)
@@ -1622,36 +1819,70 @@ def generate_samples(
         center_schedule = valid_centers[:anchor_count]
         center_schedule.extend(
             build_balanced_schedule(
-                augmentation_centers or valid_centers,
+                valid_centers,
                 target_count - anchor_count,
             )
         )
     else:
         center_schedule = build_balanced_schedule(valid_centers, target_count)
 
-    ui_clutter_schedule = build_ui_clutter_schedule(len(center_schedule))
-    scale_schedule = (
-        [1.0] * len(center_schedule)
-        if random_sampling_only
-        else build_scale_jitter_schedule(len(center_schedule))
+    occurrences = []
+    center_counts: dict[tuple[int, int], int] = {}
+    for center in center_schedule:
+        occurrences.append(center_counts.get(center, 0))
+        center_counts[center] = occurrences[-1] + 1
+
+    augmentation_center_set = set(augmentation_centers)
+    clean_passes = CONFIG["BACKGROUND_CLEAN_PASSES"]
+    can_augment = [
+        sample_region is None
+        or (
+            occurrence >= clean_passes
+            and center in augmentation_center_set
+        )
+        for center, occurrence in zip(center_schedule, occurrences)
+    ]
+    augment_indices = [
+        index for index, enabled in enumerate(can_augment) if enabled
+    ]
+    ui_clutter_schedule = [UiClutter.NONE] * len(center_schedule)
+    scale_schedule = [1.0] * len(center_schedule)
+    for index, ui_clutter in zip(
+        augment_indices,
+        build_ui_clutter_schedule(len(augment_indices)),
+    ):
+        ui_clutter_schedule[index] = ui_clutter
+    if not random_sampling_only:
+        for index, scale in zip(
+            augment_indices,
+            build_scale_jitter_schedule(len(augment_indices)),
+        ):
+            scale_schedule[index] = scale
+
+    background_schedule = build_counterfactual_background_schedule(
+        center_schedule,
+        anchor_count,
+        stream=0,
+        run_seed=background_run_seed,
     )
-    if sample_region is not None:
-        # Base 每个合法位置的首轮样本保持干净、原比例；其余轮次承接全部扰动配额。
-        ui_clutter_schedule.sort(key=lambda level: level != UiClutter.NONE)
-        scale_schedule.sort(key=lambda scale: scale != 1.0)
-        if not augmentation_centers:
-            ui_clutter_schedule = [UiClutter.NONE] * len(center_schedule)
-            scale_schedule = [1.0] * len(center_schedule)
     min_cx, max_cx = region_x + pad, region_x2 - 1 + pad
     min_cy, max_cy = region_y + pad, region_y2 - 1 + pad
 
-    for index, ((cx, cy), ui_clutter, scale) in enumerate(
-        zip(center_schedule, ui_clutter_schedule, scale_schedule)
+    for index, (
+        (cx, cy),
+        ui_clutter,
+        scale,
+        (background_kind, background_seed),
+    ) in enumerate(
+        zip(
+            center_schedule,
+            ui_clutter_schedule,
+            scale_schedule,
+            background_schedule,
+        )
     ):
         nx, ny, angle = cx, cy, 0.0
-        if index >= len(valid_centers) and (
-            sample_region is None or augmentation_centers
-        ):
+        if can_augment[index]:
             # Tile 标签由中心点决定，随机位移不能跨入相邻 tile。
             nx = min(max(cx + random.randint(-5, 5), min_cx), max_cx)
             ny = min(max(cy + random.randint(-5, 5), min_cy), max_cy)
@@ -1669,13 +1900,7 @@ def generate_samples(
             patch = extract_roi(img, cx, cy, 0, safe_size)
             scale = 1.0
 
-        if tier_context is None:
-            patch_bgr = apply_background_composition(
-                patch,
-                bg_paths,
-                background_profile,
-            )
-        else:
+        if tier_context is not None:
             parent_patch = extract_roi(
                 tier_context["parent_aligned"],
                 nx,
@@ -1684,15 +1909,18 @@ def generate_samples(
                 safe_size,
                 scale,
             )
-            patch_bgr = compose_tier_context_patch(
+            patch = compose_tier_context_patch(
                 patch,
                 parent_patch,
                 tier_context["mask_mode"],
             )
-        base_anchor = sample_region is not None and index < len(valid_centers)
-        base_clean = base_anchor or (
-            sample_region is not None and not augmentation_centers
+        patch_bgr = apply_background_composition(
+            patch,
+            bg_paths,
+            background_kind,
+            background_seed,
         )
+        base_clean = sample_region is not None and not can_augment[index]
         if base_clean:
             sample = apply_minimap_mask(patch_bgr)
         elif light_aug:
@@ -1703,17 +1931,31 @@ def generate_samples(
         if not random_sampling_only:
             sample = finalize_positive_map_sample(sample)
 
-        train_only = ui_clutter != UiClutter.NONE or scale != 1.0 or (
-            sample_region is not None and index < len(valid_centers)
+        train_only = (
+            ui_clutter != UiClutter.NONE
+            or scale != 1.0
+            or (
+                sample_region is not None
+                and occurrences[index] < clean_passes
+            )
         )
         target = train_only_samples if train_only else samples
         target.append(sample)
 
     if light_aug:
-        for (cx, cy), fill_color in build_tier_center_ui_plan(
+        center_ui_plan = build_tier_center_ui_plan(
             valid_centers,
             target_count,
-        ):
+        )
+        center_ui_backgrounds = build_background_schedule(
+            len(center_ui_plan),
+            stream=1,
+            run_seed=background_run_seed,
+        )
+        for ((cx, cy), fill_color), (
+            background_kind,
+            background_seed,
+        ) in zip(center_ui_plan, center_ui_backgrounds):
             patch_bgr = compose_patch(
                 img,
                 cx,
@@ -1722,7 +1964,8 @@ def generate_samples(
                 safe_size,
                 bg_paths,
                 1.0,
-                background_profile=background_profile,
+                background_kind=background_kind,
+                background_seed=background_seed,
                 tier_context=tier_context,
             )
             sample = (
@@ -1753,10 +1996,26 @@ def generate_samples(
     split_zone_ui_clutter = build_zone_ui_clutter_schedule(split_zone_plan)
     train_zone_scales = build_scale_jitter_schedule(len(train_zone_plan))
     split_zone_scales = build_scale_jitter_schedule(len(split_zone_plan))
-    for ((cx, cy), fill_color), ui_clutter, scale in zip(
+    train_zone_backgrounds = build_background_schedule(
+        len(train_zone_plan),
+        stream=2,
+        run_seed=background_run_seed,
+    )
+    split_zone_backgrounds = build_background_schedule(
+        len(split_zone_plan),
+        stream=3,
+        run_seed=background_run_seed,
+    )
+    for (
+        ((cx, cy), fill_color),
+        ui_clutter,
+        scale,
+        (background_kind, background_seed),
+    ) in zip(
         train_zone_plan,
         train_zone_ui_clutter,
         train_zone_scales,
+        train_zone_backgrounds,
     ):
         patch_bgr = compose_patch(
             img,
@@ -1766,15 +2025,22 @@ def generate_samples(
             safe_size,
             bg_paths,
             scale,
-            background_profile=background_profile,
+            background_kind=background_kind,
+            background_seed=background_seed,
             tier_context=tier_context,
         )
         sample = augment_zone_patch(patch_bgr, fill_color, ui_clutter)
         train_only_samples.append(finalize_positive_map_sample(sample))
-    for ((cx, cy), fill_color), ui_clutter, scale in zip(
+    for (
+        ((cx, cy), fill_color),
+        ui_clutter,
+        scale,
+        (background_kind, background_seed),
+    ) in zip(
         split_zone_plan,
         split_zone_ui_clutter,
         split_zone_scales,
+        split_zone_backgrounds,
     ):
         patch_bgr = compose_patch(
             img,
@@ -1784,7 +2050,8 @@ def generate_samples(
             safe_size,
             bg_paths,
             scale,
-            background_profile=background_profile,
+            background_kind=background_kind,
+            background_seed=background_seed,
             tier_context=tier_context,
         )
         sample = augment_zone_patch(patch_bgr, fill_color, ui_clutter)
@@ -1883,6 +2150,7 @@ def process_image_task(
     bg_paths: list,
     target_count_override: int | None = None,
     tier_spec: dict | None = None,
+    background_run_seed: int = 0,
 ):
     """单张源图处理入口，供 ProcessPoolExecutor 调度。"""
     safe_size = get_safe_size()
@@ -1923,6 +2191,7 @@ def process_image_task(
                 safe_size,
                 bg_paths,
                 sample_region=region,
+                background_run_seed=background_run_seed,
             )
 
             tile_mapping[tile_class] = {
@@ -1967,6 +2236,7 @@ def process_image_task(
         light_aug=is_tier,
         random_sampling_only=is_none,
         tier_context=tier_context,
+        background_run_seed=background_run_seed,
     )
 
     save_dataset(
@@ -2007,6 +2277,7 @@ class DataPreprocessor:
         self.max_workers = max_workers
         self.map_export_path = Path(map_export_path)
         self.tier_specs = None
+        self.background_run_seed = random.getrandbits(64)
         if self.map_export_path.exists():
             self.tier_specs = load_map_export_manifest(
                 self.map_export_path,
@@ -2018,7 +2289,12 @@ class DataPreprocessor:
         if bg_dir_path and bg_dir_path.exists():
             for ext in ["*.[pP][nN][gG]", "*.[jJ][pP][gG]"]:
                 self.bg_paths.extend(list(bg_dir_path.glob(ext)))
-        logger.info(f"Discovered {len(self.bg_paths)} background images.")
+        self.bg_paths.extend(sorted(self.input_dir.glob("*Base.png")))
+        self.bg_paths = list(dict.fromkeys(self.bg_paths))
+        logger.info(
+            f"Discovered {len(self.bg_paths)} shared background distractor sources."
+        )
+        logger.info(f"Background generation seed: {self.background_run_seed}")
 
     def run(self) -> None:
         """执行完整预处理流水线。"""
@@ -2104,6 +2380,7 @@ class DataPreprocessor:
                     self.bg_paths,
                     target_count_override,
                     self.tier_specs.get(class_name) if self.tier_specs else None,
+                    self.background_run_seed,
                 ): file_path
                 for file_path, class_name, target_count_override in tasks
             }
