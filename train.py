@@ -12,7 +12,7 @@ train.py — YOLO 分类器训练脚本
 用法:
     python train.py [--data <dir>] [--model <path|auto>]
                     [--epochs <int>] [--imgsz <int>] [--batch <int>]
-                    [--workers <int>] [--patience <int>]
+                    [--nbs <int>] [--workers <int>] [--patience <int>]
                     [--device <id>] [--name <str>]
 """
 
@@ -36,7 +36,8 @@ DEFAULT_CONFIG = {
     "data": "dataset",  # 数据集根目录
     "model": "auto",   # 权重路径，"auto" 表示自动发现最新历史权重
     "imgsz": 128,      # 训练输入图像尺寸（正方形边长）
-    "batch": 128,      # 每步训练的样本数
+    "batch": 512,      # 每步训练的样本数
+    "nbs": 256,        # 名义 batch；保持有效 weight decay 与原 128/64 配置一致
     "workers": 24,     # DataLoader 并行工作线程数
     "patience": 20,    # 早停等待轮数（验证指标无提升时触发）
     "epochs": 200,     # 最大训练轮数
@@ -214,6 +215,7 @@ def train(args: argparse.Namespace) -> None:
         epochs=args.epochs,
         imgsz=args.imgsz,
         batch=args.batch,
+        nbs=args.nbs,
         workers=args.workers,
         device=args.device,
         patience=args.patience,
@@ -255,6 +257,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=argparse.SUPPRESS,
         help=f"Batch size (default: {DEFAULT_CONFIG['batch']})",
+    )
+    parser.add_argument(
+        "--nbs",
+        type=int,
+        default=argparse.SUPPRESS,
+        help=f"Nominal batch size for optimizer scaling (default: {DEFAULT_CONFIG['nbs']})",
     )
     parser.add_argument(
         "--workers",
