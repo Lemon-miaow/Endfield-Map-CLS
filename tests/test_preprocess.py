@@ -344,6 +344,15 @@ class TierSamplingTests(unittest.TestCase):
         self.assertFalse(mask[4, 4])
         self.assertFalse(mask[0, 63])
 
+    def test_center_mask_excludes_dimmed_parent_context(self) -> None:
+        image = np.full((64, 64, 4), (40, 40, 40, 255), dtype=np.uint8)
+        image[24:40, 24:40, :3] = 220
+
+        mask = build_tier_center_mask(image)
+
+        self.assertFalse(mask[8, 8])
+        self.assertTrue(mask[32, 32])
+
     def test_small_centered_tier_uses_tier_coverage_thresholds(self) -> None:
         image = np.zeros((128, 128, 4), dtype=np.uint8)
         image[47:81, 47:81, 3] = 255

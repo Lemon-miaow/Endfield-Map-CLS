@@ -59,7 +59,6 @@ CONFIG = {
     "SCALE_JITTER_RATIO": 0.25,         # 训练专用尺度扰动样本比例
     "SCALE_JITTER_MIN": 0.90,
     "SCALE_JITTER_MAX": 1.10,
-    "TIER_CENTER_DILATION": 0,          # Tier 中心必须落在可见地图结构上
     "TIER_MIN_MAP_CENTER_COVERAGE": 0.15,  # Tier 中心区域最低地图覆盖率
     "STD_THRESHOLD": 5.0,              # 保留兼容字段，实际有效性使用 MIN_VALID_STD
     "OCCLUSION_COUNT": 0,              # 保留兼容字段
@@ -1505,22 +1504,24 @@ def build_tier_center_mask(
     img: np.ndarray,
     mask_mode: str = "opaque",
 ) -> np.ndarray:
-    """生成 Tier 地图结构及其邻近区域的合法中心掩码。"""
+    """生成只包含 Tier 高亮层的合法中心掩码。"""
     alpha = img[..., 3]
     premultiplied = (
         img[..., :3].astype(np.float32) * (alpha.astype(np.float32)[..., None] / 255.0)
     ).astype(np.uint8)
     gray = cv2.cvtColor(premultiplied, cv2.COLOR_BGR2GRAY)
-    gray_threshold = 18 if mask_mode == "bright" else 12
-    structure = ((alpha > 10) & (gray > gray_threshold)).astype(np.uint8)
-    radius = CONFIG["TIER_CENTER_DILATION"]
-    if radius <= 0:
-        return structure > 0
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (radius * 2 + 1, radius * 2 + 1),
+    visible = alpha > 10
+    if not np.any(visible):
+        return visible
+
+    threshold, _ = cv2.threshold(
+        gray[visible],
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
     )
-    return cv2.dilate(structure, kernel) > 0
+    floor = 18 if mask_mode == "bright" else 12
+    return visible & (gray > max(floor, threshold))
 
 
 def build_balanced_schedule(items: list, count: int) -> list:
