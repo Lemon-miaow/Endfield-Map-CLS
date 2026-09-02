@@ -340,7 +340,7 @@ class TierSamplingTests(unittest.TestCase):
         mask = build_tier_center_mask(image)
 
         self.assertTrue(mask[32, 32])
-        self.assertTrue(mask[32, 24])
+        self.assertFalse(mask[32, 24])
         self.assertFalse(mask[4, 4])
         self.assertFalse(mask[0, 63])
 

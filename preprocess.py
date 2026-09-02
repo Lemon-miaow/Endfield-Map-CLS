@@ -59,7 +59,8 @@ CONFIG = {
     "SCALE_JITTER_RATIO": 0.25,         # 训练专用尺度扰动样本比例
     "SCALE_JITTER_MIN": 0.90,
     "SCALE_JITTER_MAX": 1.10,
-    "TIER_CENTER_DILATION": 8,          # Tier 中心只在地图结构附近采样
+    "TIER_CENTER_DILATION": 0,          # Tier 中心必须落在可见地图结构上
+    "TIER_MIN_MAP_CENTER_COVERAGE": 0.15,  # Tier 中心区域最低地图覆盖率
     "STD_THRESHOLD": 5.0,              # 保留兼容字段，实际有效性使用 MIN_VALID_STD
     "OCCLUSION_COUNT": 0,              # 保留兼容字段
     "OCCLUSION_SIZE": 0,               # 保留兼容字段
@@ -1513,6 +1514,8 @@ def build_tier_center_mask(
     gray_threshold = 18 if mask_mode == "bright" else 12
     structure = ((alpha > 10) & (gray > gray_threshold)).astype(np.uint8)
     radius = CONFIG["TIER_CENTER_DILATION"]
+    if radius <= 0:
+        return structure > 0
     kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
         (radius * 2 + 1, radius * 2 + 1),
@@ -1753,6 +1756,11 @@ def generate_samples(
         if light_aug
         else CONFIG["MIN_ALPHA_CIRCLE_COVERAGE"]
     )
+    min_map_center_coverage = (
+        CONFIG["TIER_MIN_MAP_CENTER_COVERAGE"]
+        if light_aug
+        else None
+    )
 
     valid_centers = []
     if random_sampling_only:
@@ -1772,6 +1780,7 @@ def generate_samples(
             if is_valid(
                 extract_roi(img, cx, cy, 0, safe_size),
                 min_map_circle_coverage=min_map_circle_coverage,
+                min_map_center_coverage=min_map_center_coverage,
                 min_alpha_circle_coverage=min_alpha_circle_coverage,
             ):
                 valid_centers.append((cx, cy))
@@ -1786,6 +1795,7 @@ def generate_samples(
                 if is_valid(
                     extract_roi(img, cx, cy, 0, safe_size),
                     min_map_circle_coverage=min_map_circle_coverage,
+                    min_map_center_coverage=min_map_center_coverage,
                     min_alpha_circle_coverage=min_alpha_circle_coverage,
                 ):
                     valid_centers.append((cx, cy))
@@ -1894,6 +1904,7 @@ def generate_samples(
         if not is_valid(
             patch,
             min_map_circle_coverage=min_map_circle_coverage,
+            min_map_center_coverage=min_map_center_coverage,
             min_alpha_circle_coverage=min_alpha_circle_coverage,
         ):
             nx, ny, angle = cx, cy, 0.0
