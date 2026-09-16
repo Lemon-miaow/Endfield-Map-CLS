@@ -49,23 +49,32 @@ CONFIG = {
     "OUTPUT_SIZE": 128,                # 输出训练图像边长
     "MASK_DIAMETER": 106,              # 小地图圆形有效区域直径
     "TARGET_COUNT": 1200,              # 普通类别目标样本数
-    "TIER_TARGET_COUNT": 300,          # Tier 类目标样本数
+    # Tier 合法中心锁在导出高亮前景后，中位数由八月 81 降到 38；固定 1000 张使每中心训练样本
+    # 中位数由 5.2 升到 21.6、Tier 训练占比由 11.4% 升到 18.3%，相邻 Tier 与 Base 实机帧被吸走概率。
+    # 总量随合法中心数增长，下限为八月最小配额 300 + 150 + 60。
+    "TIER_SAMPLES_PER_CENTER": 6,      # Tier 每个合法中心的样本数（八月 Tier 中位约 6.6，Base 满格 tile 4.5）
+    "TIER_MIN_COUNT": 510,             # Tier 类样本下限
+    "TIER_MAX_COUNT": 1000,            # Tier 类样本上限
     "NONE_CLASS_TOTAL_CAP": 3000,      # None 类总样本上限
     "NONE_PER_IMAGE_MIN": 40,          # 单张 None 图最小采样数
     "NONE_PER_IMAGE_MAX": 100,         # 单张 None 图最大采样数
     "VAL_RATIO": 0.2,                  # 验证集比例
     "STRIDE": 8,                       # 滑窗扫描步长
     "ANGLE_JITTER": 0.5,               # 随机旋转扰动角度
-    "SCALE_JITTER_RATIO": 0.25,         # 训练专用尺度扰动样本比例
-    "SCALE_JITTER_MIN": 0.90,
-    "SCALE_JITTER_MAX": 1.10,
+    # 小地图尺度固定（实机相对源图实测 1.00–1.06），全流程保持原尺度，不做尺度扰动。
+    # 实机渲染的细纹理与源图存在差异；插值平滑随 RandomResizedCrop 一起消失后由地图层模糊补回。
+    "MAP_BLUR_PROB": 0.30,              # 增强样本在叠加 UI 前模糊地图层的概率
+    "MAP_BLUR_SIGMA_MIN": 0.4,
+    "MAP_BLUR_SIGMA_MAX": 1.0,
     "TIER_MIN_MAP_CENTER_COVERAGE": 0.15,  # Tier 中心区域最低地图覆盖率
     "STD_THRESHOLD": 5.0,              # 保留兼容字段，实际有效性使用 MIN_VALID_STD
     "OCCLUSION_COUNT": 0,              # 保留兼容字段
     "OCCLUSION_SIZE": 0,               # 保留兼容字段
     "ERROR_OVERSAMPLE": 5,             # 困难样本过采样倍数
     "ERROR_MIN_RATIO": 0.05,           # 困难样本至少占该类生成样本的比例
-    "BACKGROUND_CLEAN_PASSES": 2,      # 每个 Base 中心保留黑底与纹理底同构样本
+    # 每个 Base 中心保留一次黑底干净锚点，其余出现全部进入图标与模糊增强；
+    # 满格 tile 约 400 个中心，取 2 会占掉 2/3 主样本，使图标干扰样本比八月减半。
+    "BACKGROUND_CLEAN_PASSES": 1,
     "BASE_CLASS_NAMES": {"Map01Base", "Map02Base"},
     "TILE_SIZE": 160,
     "TILE_STRIDE": 160,
@@ -85,6 +94,17 @@ CONFIG = {
     "UI_ZONE_MIN_RADIUS": 28,
     "UI_ZONE_MAX_RADIUS": 40,
     "UI_ZONE_EDGE_LEAK_PROB": 0.35,
+    # 滑索方向指示：地图上贯穿的青白 V 形箭头链，外带很淡的青色柔光。按 Tier388/Tier321 实机帧实测：
+    # 箭头宽约 5px、深约 2px、间距约 5px，1px 亮芯最亮 20% 约 BGR(214,212,185)；
+    # 光晕在暗底上距芯 1–2px 约 +25~40、4–5px 约 +8~13，B-R 偏青约 +15。取点与黄/白路线相同，出现概率也相同。
+    "UI_ZIPLINE_PROB": 0.70,
+    "UI_ZIPLINE_MAX_POINTS": 4,
+    "UI_ZIPLINE_SPACING_MIN": 4.8,
+    "UI_ZIPLINE_SPACING_MAX": 5.8,
+    "UI_ZIPLINE_ARM_MIN": 2.5,
+    "UI_ZIPLINE_ARM_MAX": 3.2,
+    "UI_ZIPLINE_ALPHA": 0.95,
+    "UI_ZIPLINE_GLOW_SIGMA": 3.0,
     "EXTREME_UI_PROB": 0.06,
     "EXTREME_UI_PACK_MIN": 1,
     "EXTREME_UI_PACK_MAX": 2,
@@ -147,7 +167,7 @@ DEFAULT_OPTIONS = {
 
 CONFIG_OVERRIDES = {
     "target_count": "TARGET_COUNT",
-    "tier_target_count": "TIER_TARGET_COUNT",
+    "tier_max_count": "TIER_MAX_COUNT",
     "none_total_cap": "NONE_CLASS_TOTAL_CAP",
     "none_per_image_min": "NONE_PER_IMAGE_MIN",
     "none_per_image_max": "NONE_PER_IMAGE_MAX",
@@ -181,7 +201,7 @@ def safe_imwrite(path, img):
     return is_success
 
 
-MAP_EXPORT_FORMAT = "map-cls-export-v1"
+MAP_EXPORT_FORMAT = "map-cls-export-v2"
 
 
 def _resolve_export_file(input_dir: Path, value: str, field: str) -> Path:
@@ -221,12 +241,33 @@ def _manifest_affine(value, field: str) -> tuple[float, float, float, float]:
     return affine
 
 
+def decode_foreground_runs(runs, size: tuple[int, int]) -> np.ndarray:
+    """解码导出前景的行优先 [起点, 长度]，拒绝缺失或越界掩码。"""
+    if not isinstance(runs, list) or not runs:
+        raise ValueError("map_export.json requires non-empty foreground_runs exported before Base composition")
+    width, height = size
+    mask = np.zeros(width * height, dtype=bool)
+    previous_end = 0
+    for run in runs:
+        if not isinstance(run, list) or len(run) != 2 or any(
+            isinstance(value, bool) or not isinstance(value, int) for value in run
+        ):
+            raise ValueError("foreground_runs must contain integer [start, length] pairs")
+        start, length = run
+        end = start + length
+        if start < previous_end or length <= 0 or end > mask.size:
+            raise ValueError(f"foreground_runs contains an overlapping or out-of-bounds span: {run}")
+        mask[start:end] = True
+        previous_end = end
+    return mask.reshape(height, width)
+
+
 def load_map_export_manifest(path: Path, input_dir: Path) -> dict[str, dict]:
     """Load the portable Tier-to-parent contract used by CLS.
 
-    The manifest contains only resolved facts (filenames, dimensions, and a
-    diagonal affine).  No exporter module is imported here, so the training
-    repository remains independent of the producer.
+    The manifest contains only resolved facts (filenames, dimensions, a
+    diagonal affine, and pre-composition foreground masks). No exporter module
+    is imported here, so the training repository remains independent of the producer.
     """
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -297,6 +338,7 @@ def load_map_export_manifest(path: Path, input_dir: Path) -> dict[str, dict]:
             "parent_size": parent_size,
             "affine": affine,
             "mask_mode": mask_mode,
+            "center_mask": decode_foreground_runs(raw.get("foreground_runs"), template_size),
         }
     return specs
 
@@ -665,8 +707,75 @@ def draw_zone_overlay(img: np.ndarray, fill_color: tuple[int, int, int]) -> np.n
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
+ZIPLINE_CORE_BGR = (214, 216, 188)
+ZIPLINE_GLOW_BGR = (45, 45, 30)
+
+
+def sample_route_points(h: int, w: int, max_points: int) -> list[tuple[int, int]]:
+    """在小地图圆内取 2..max_points 个点，沿随机方向排序成不回折的折线。"""
+    points = [
+        sample_minimap_center(h, w)
+        for _ in range(random.randint(2, max_points))
+    ]
+    angle = random.uniform(0, math.tau)
+    axis = (math.cos(angle), math.sin(angle))
+    points.sort(key=lambda point: point[0] * axis[0] + point[1] * axis[1])
+    return points
+
+
+def draw_zipline_arrows(
+    img: np.ndarray,
+    points: list[tuple[int, int]],
+) -> np.ndarray:
+    """沿折线画滑索方向指示：淡青柔光上等距排列的 V 形箭头，箭头尖指向折线前进方向。"""
+    h, w = img.shape[:2]
+    line = np.zeros((h, w), dtype=np.uint8)
+    cv2.polylines(line, [np.asarray(points, dtype=np.int32)], False, 255, 1, lineType=cv2.LINE_AA)
+    sigma = CONFIG["UI_ZIPLINE_GLOW_SIGMA"]
+    # 模糊把 1px 线心摊薄到 1/(σ√2π)，乘回去让线心光晕强度为 1；滤色叠加让亮底上几乎不变。
+    glow = cv2.GaussianBlur(line.astype(np.float32) / 255.0, (0, 0), sigma) * sigma * math.sqrt(math.tau)
+    halo = np.clip(glow, 0.0, 1.0)[..., None] * (np.asarray(ZIPLINE_GLOW_BGR, dtype=np.float32) / 255.0)
+    base = 1.0 - (1.0 - img.astype(np.float32) / 255.0) * (1.0 - halo)
+    base = np.clip(base * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+    arrows = base.copy()
+    spacing = random.uniform(CONFIG["UI_ZIPLINE_SPACING_MIN"], CONFIG["UI_ZIPLINE_SPACING_MAX"])
+    arm = random.uniform(CONFIG["UI_ZIPLINE_ARM_MIN"], CONFIG["UI_ZIPLINE_ARM_MAX"])
+    back = spread = arm * math.sqrt(0.5)
+    shift = 2
+
+    def to_fixed(x: float, y: float) -> tuple[int, int]:
+        return round(x * (1 << shift)), round(y * (1 << shift))
+
+    phase = random.uniform(0, spacing)
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        length = math.hypot(x1 - x0, y1 - y0)
+        if length < 1:
+            continue
+        dx, dy = (x1 - x0) / length, (y1 - y0) / length
+        t = phase
+        while t <= length:
+            tip_x, tip_y = x0 + dx * t, y0 + dy * t
+            for side in (-1, 1):
+                cv2.line(
+                    arrows,
+                    to_fixed(tip_x, tip_y),
+                    to_fixed(tip_x - dx * back - dy * spread * side, tip_y - dy * back + dx * spread * side),
+                    ZIPLINE_CORE_BGR,
+                    1,
+                    lineType=cv2.LINE_AA,
+                    shift=shift,
+                )
+            t += spacing
+        # 折点处延续箭头节奏，避免每段起点都挤一个箭头。
+        phase = t - length
+
+    alpha = CONFIG["UI_ZIPLINE_ALPHA"]
+    return cv2.addWeighted(arrows, alpha, base, 1.0 - alpha, 0)
+
+
 def draw_random_ui_lines(img: np.ndarray) -> np.ndarray:
-    """绘制轻量路线线条，模拟小地图上的路径 UI。"""
+    """绘制轻量路线线条与滑索方向指示，模拟小地图上的路径 UI。"""
     h, w = img.shape[:2]
     overlay = img.copy()
     route_specs = (
@@ -677,13 +786,7 @@ def draw_random_ui_lines(img: np.ndarray) -> np.ndarray:
     for color, max_points in route_specs:
         if random.random() >= 0.7:
             continue
-        points = [
-            sample_minimap_center(h, w)
-            for _ in range(random.randint(2, max_points))
-        ]
-        angle = random.uniform(0, math.tau)
-        axis = (math.cos(angle), math.sin(angle))
-        points.sort(key=lambda point: point[0] * axis[0] + point[1] * axis[1])
+        points = sample_route_points(h, w, max_points)
         cv2.polylines(
             overlay,
             [np.asarray(points, dtype=np.int32)],
@@ -693,7 +796,13 @@ def draw_random_ui_lines(img: np.ndarray) -> np.ndarray:
             lineType=cv2.LINE_AA,
         )
 
-    return cv2.addWeighted(overlay, 0.78, img, 0.22, 0)
+    result = cv2.addWeighted(overlay, 0.78, img, 0.22, 0)
+    if random.random() < CONFIG["UI_ZIPLINE_PROB"]:
+        points = sample_route_points(h, w, CONFIG["UI_ZIPLINE_MAX_POINTS"])
+        if random.random() < 0.5:
+            points.reverse()
+        result = draw_zipline_arrows(result, points)
+    return result
 
 
 def get_ui_icon_assets(icon_dir: str = "icon") -> dict:
@@ -936,6 +1045,7 @@ def build_tier_parent_context(
     return {
         "parent_aligned": parent_aligned,
         "mask_mode": tier_spec["mask_mode"],
+        "center_mask": tier_spec["center_mask"],
     }
 
 
@@ -1013,14 +1123,13 @@ def extract_roi(
     cy: int,
     angle: float,
     safe_size: int,
-    scale: float = 1.0,
 ) -> np.ndarray:
     """以中心点裁出 ROI，按需旋转后返回训练尺寸图块。"""
     half = safe_size // 2
     patch = img[cy - half : cy + half, cx - half : cx + half]
 
-    if angle != 0 or scale != 1.0:
-        M = cv2.getRotationMatrix2D((half, half), angle, scale)
+    if angle != 0:
+        M = cv2.getRotationMatrix2D((half, half), angle, 1.0)
         border_val = (0, 0, 0, 0) if patch.shape[2] == 4 else (0, 0, 0)
         patch = cv2.warpAffine(patch, M, (safe_size, safe_size), borderValue=border_val)
 
@@ -1131,6 +1240,14 @@ def add_photometric_distortion(img: np.ndarray) -> np.ndarray:
     return img
 
 
+def add_map_blur(img: np.ndarray) -> np.ndarray:
+    """在叠加 UI 前模糊地图层，让模型依赖粗粒度地形；图标保持清晰，与实机一致。"""
+    if random.random() < CONFIG["MAP_BLUR_PROB"]:
+        sigma = random.uniform(CONFIG["MAP_BLUR_SIGMA_MIN"], CONFIG["MAP_BLUR_SIGMA_MAX"])
+        img = cv2.GaussianBlur(img, (0, 0), sigma)
+    return img
+
+
 def apply_random_occlusion(patch: np.ndarray) -> np.ndarray:
     """保留旧接口；当前验证配置不启用额外遮挡。"""
     return patch
@@ -1181,6 +1298,7 @@ def augment_patch(
     """对普通类别样本执行完整增强。"""
     if random.random() < 0.15:
         patch = add_photometric_distortion(patch)
+    patch = add_map_blur(patch)
 
     if ui_clutter != UiClutter.NONE or random.random() < 0.85:
         patch = add_central_ui_simulation(patch, ui_clutter=ui_clutter)
@@ -1195,6 +1313,7 @@ def augment_patch_light(
     """对 Tier 类执行较轻增强，避免过度扰动小样本类别。"""
     if random.random() < 0.15:
         patch = add_photometric_distortion(patch)
+    patch = add_map_blur(patch)
 
     if ui_clutter != UiClutter.NONE or random.random() < 0.85:
         patch = add_central_ui_simulation(patch, ui_clutter=ui_clutter)
@@ -1210,6 +1329,7 @@ def augment_zone_patch(
     """生成一个必定包含区域圈的额外地图样本。"""
     if random.random() < 0.15:
         patch = add_photometric_distortion(patch)
+    patch = add_map_blur(patch)
 
     patch = draw_zone_overlay(patch, fill_color)
     if ui_clutter != UiClutter.NONE or random.random() < 0.85:
@@ -1471,13 +1591,12 @@ def compose_patch(
     angle: float,
     safe_size: int,
     bg_paths: list,
-    scale: float = 1.0,
     background_kind: BackgroundKind = BackgroundKind.BLACK,
     background_seed: int | None = None,
     tier_context: dict | None = None,
 ) -> np.ndarray:
     """提取图块并合成背景。"""
-    patch_bgra = extract_roi(img, cx, cy, angle, safe_size, scale)
+    patch_bgra = extract_roi(img, cx, cy, angle, safe_size)
     if tier_context is not None:
         parent_patch = extract_roi(
             tier_context["parent_aligned"],
@@ -1485,7 +1604,6 @@ def compose_patch(
             cy,
             angle,
             safe_size,
-            scale,
         )
         patch_bgra = compose_tier_context_patch(
             patch_bgra,
@@ -1500,28 +1618,14 @@ def compose_patch(
     )
 
 
-def build_tier_center_mask(
-    img: np.ndarray,
-    mask_mode: str = "opaque",
-) -> np.ndarray:
-    """生成只包含 Tier 高亮层的合法中心掩码。"""
+def build_map_center_mask(img: np.ndarray) -> np.ndarray:
+    """仅用于未叠加背景的地图：排除黑洞，保留灰色地图阴影。"""
     alpha = img[..., 3]
     premultiplied = (
         img[..., :3].astype(np.float32) * (alpha.astype(np.float32)[..., None] / 255.0)
     ).astype(np.uint8)
     gray = cv2.cvtColor(premultiplied, cv2.COLOR_BGR2GRAY)
-    visible = alpha > 10
-    if not np.any(visible):
-        return visible
-
-    threshold, _ = cv2.threshold(
-        gray[visible],
-        0,
-        255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-    )
-    floor = 18 if mask_mode == "bright" else 12
-    return visible & (gray > max(floor, threshold))
+    return (alpha > 10) & (gray > 0)
 
 
 def build_balanced_schedule(items: list, count: int) -> list:
@@ -1537,10 +1641,20 @@ def build_balanced_schedule(items: list, count: int) -> list:
     return schedule
 
 
-def build_ui_clutter_schedule(sample_count: int) -> list[UiClutter]:
-    """保持原密集比例，并将其中少量样本固定为超极端 UI。"""
-    extreme_count = round(sample_count * 0.85 * CONFIG["EXTREME_UI_PROB"])
-    ultra_count = round(sample_count * 0.85 * CONFIG["ULTRA_UI_PROB"])
+def build_ui_clutter_schedule(
+    sample_count: int,
+    quota_count: int | None = None,
+) -> list[UiClutter]:
+    """保持原密集比例，并将其中少量样本固定为超极端 UI。
+
+    quota_count 为计算密集配额所用的样本数，默认等于 sample_count；配额不超过可用位置。
+    """
+    quota_count = sample_count if quota_count is None else quota_count
+    extreme_count = min(
+        sample_count,
+        round(quota_count * 0.85 * CONFIG["EXTREME_UI_PROB"]),
+    )
+    ultra_count = round(quota_count * 0.85 * CONFIG["ULTRA_UI_PROB"])
     if extreme_count:
         ultra_count = min(extreme_count, max(1, ultra_count))
 
@@ -1566,24 +1680,6 @@ def build_zone_ui_clutter_schedule(
         ]
         for index, ui_clutter in zip(indices, build_ui_clutter_schedule(len(indices))):
             schedule[index] = ui_clutter
-    return schedule
-
-
-def build_scale_jitter_schedule(sample_count: int) -> list[float]:
-    """按固定配额生成对称尺度扰动，其余样本保持原尺寸。"""
-    jitter_count = round(sample_count * CONFIG["SCALE_JITTER_RATIO"])
-    smaller_count = (jitter_count + 1) // 2
-    larger_count = jitter_count - smaller_count
-    schedule = [
-        random.uniform(CONFIG["SCALE_JITTER_MIN"], 1.0)
-        for _ in range(smaller_count)
-    ]
-    schedule.extend(
-        random.uniform(1.0, CONFIG["SCALE_JITTER_MAX"])
-        for _ in range(larger_count)
-    )
-    schedule.extend([1.0] * (sample_count - jitter_count))
-    random.shuffle(schedule)
     return schedule
 
 
@@ -1615,23 +1711,48 @@ def build_zone_plan(
 
 def build_tier_center_ui_plan(
     valid_centers: list[tuple[int, int]],
-    target_count: int,
+    sample_count: int,
 ) -> list[tuple[tuple[int, int], tuple[int, int, int] | None]]:
-    """让每个 Tier 合法中心至少包含一次原尺寸中心图标簇。"""
-    count = max(
-        len(valid_centers),
-        round(target_count * CONFIG["TIER_CENTER_UI_EXTRA_RATIO"]),
-    )
-    centers = build_balanced_schedule(valid_centers, count)
-    zone_count = round(count * CONFIG["TIER_CENTER_UI_ZONE_RATIO"])
+    """按固定配额在 Tier 合法中心生成中心图标簇。"""
+    centers = build_balanced_schedule(valid_centers, sample_count)
+    zone_count = round(sample_count * CONFIG["TIER_CENTER_UI_ZONE_RATIO"])
     yellow_count = round(zone_count * CONFIG["UI_ZONE_YELLOW_PROB"])
     colors = (
         [ZONE_YELLOW_BGR] * yellow_count
         + [ZONE_BLUE_BGR] * (zone_count - yellow_count)
-        + [None] * (count - zone_count)
+        + [None] * (sample_count - zone_count)
     )
     random.shuffle(colors)
     return list(zip(centers, colors))
+
+
+def tier_sample_count(center_count: int) -> int:
+    """Tier 总样本数随合法中心数增长，限制在配置的上下限内。"""
+    return min(
+        CONFIG["TIER_MAX_COUNT"],
+        max(
+            CONFIG["TIER_MIN_COUNT"],
+            round(center_count * CONFIG["TIER_SAMPLES_PER_CENTER"]),
+        ),
+    )
+
+
+def split_tier_sample_budget(total_count: int, center_count: int) -> tuple[int, int, int]:
+    """将八月的 300 + 150 + max(中心数, 60) 配比归一到给定总量。"""
+    reference_count = 300
+    zone_ratio = CONFIG["UI_ZONE_EXTRA_RATIO"]
+    center_weight = max(
+        center_count,
+        round(reference_count * CONFIG["TIER_CENTER_UI_EXTRA_RATIO"]),
+    )
+    total_weight = reference_count * (1.0 + zone_ratio) + center_weight
+    center_ui_count = max(center_count, round(total_count * center_weight / total_weight))
+    remaining_count = total_count - center_ui_count
+    primary_count = round(remaining_count / (1.0 + zone_ratio))
+    zone_count = remaining_count - primary_count
+    if primary_count <= 0:
+        raise ValueError(f"Tier budget {total_count} cannot cover {center_count} centers and ordinary samples")
+    return primary_count, zone_count, center_ui_count
 
 
 def load_error_images(
@@ -1711,13 +1832,14 @@ def generate_samples(
     tier_context: dict | None = None,
     background_run_seed: int = 0,
 ) -> tuple[list, list]:
-    """生成 TARGET_COUNT 个基础样本，并为地图类追加区域圈干扰样本。
+    """生成地图样本；Tier 按合法中心数确定总预算后分桶，其他类别保留追加增强。
 
     sample_region:
         (x, y, w, h)，坐标相对于原图（未 pad）。
         若为 None，则扫描整张原图。
     """
-    target_count = target_count or CONFIG["TARGET_COUNT"]
+    if not light_aug:
+        target_count = target_count or CONFIG["TARGET_COUNT"]
     h, w = img.shape[:2]
     pad = safe_size // 2
     orig_h, orig_w = h - 2 * pad, w - 2 * pad
@@ -1734,10 +1856,7 @@ def generate_samples(
     region_x2 = region_x + region_w
     region_y2 = region_y + region_h
     tier_center_mask = (
-        build_tier_center_mask(
-            img[pad : pad + orig_h, pad : pad + orig_w],
-            tier_context["mask_mode"] if tier_context is not None else "opaque",
-        )
+        tier_context["center_mask"]
         if light_aug
         else None
     )
@@ -1773,6 +1892,8 @@ def generate_samples(
 
             x = random.randint(region_x, max(region_x, region_x2 - 1))
             y = random.randint(region_y, max(region_y, region_y2 - 1))
+            if center_mask is not None and not center_mask[y, x]:
+                continue
             cx, cy = x + pad, y + pad
             if (cx, cy) in seen_centers:
                 continue
@@ -1807,6 +1928,23 @@ def generate_samples(
     if sample_region is not None and len(valid_centers) < CONFIG["MIN_VALID_CENTERS_PER_TILE"]:
         return [], []
 
+    if sample_region is not None:
+        # 保留既有 tile 入选门槛，只从入选 tile 的采样落点中移除黑洞。
+        center_mask = build_map_center_mask(img[pad : pad + orig_h, pad : pad + orig_w])
+        valid_centers = [(cx, cy) for cx, cy in valid_centers if center_mask[cy - pad, cx - pad]]
+        if not valid_centers:
+            return [], []
+
+    if light_aug:
+        target_count = target_count or tier_sample_count(len(valid_centers))
+        primary_count, zone_count, center_ui_count = split_tier_sample_budget(
+            target_count, len(valid_centers)
+        )
+    else:
+        primary_count = target_count
+        zone_count = round(target_count * CONFIG["UI_ZONE_EXTRA_RATIO"])
+        center_ui_count = 0
+
     samples = []
     train_only_samples = []
     augmentation_centers = valid_centers
@@ -1826,16 +1964,16 @@ def generate_samples(
                 min_alpha_circle_coverage=min_alpha_circle_coverage,
             )
         ]
-        anchor_count = min(len(valid_centers), target_count)
+        anchor_count = min(len(valid_centers), primary_count)
         center_schedule = valid_centers[:anchor_count]
         center_schedule.extend(
             build_balanced_schedule(
                 valid_centers,
-                target_count - anchor_count,
+                primary_count - anchor_count,
             )
         )
     else:
-        center_schedule = build_balanced_schedule(valid_centers, target_count)
+        center_schedule = build_balanced_schedule(valid_centers, primary_count)
 
     occurrences = []
     center_counts: dict[tuple[int, int], int] = {}
@@ -1857,18 +1995,15 @@ def generate_samples(
         index for index, enabled in enumerate(can_augment) if enabled
     ]
     ui_clutter_schedule = [UiClutter.NONE] * len(center_schedule)
-    scale_schedule = [1.0] * len(center_schedule)
+    # Base 锚点不承接图标，密集配额仍按整类主样本数计算，避免锚点挤掉极端图标样本。
     for index, ui_clutter in zip(
         augment_indices,
-        build_ui_clutter_schedule(len(augment_indices)),
+        build_ui_clutter_schedule(
+            len(augment_indices),
+            primary_count if sample_region is not None else None,
+        ),
     ):
         ui_clutter_schedule[index] = ui_clutter
-    if not random_sampling_only:
-        for index, scale in zip(
-            augment_indices,
-            build_scale_jitter_schedule(len(augment_indices)),
-        ):
-            scale_schedule[index] = scale
 
     background_schedule = build_counterfactual_background_schedule(
         center_schedule,
@@ -1882,13 +2017,11 @@ def generate_samples(
     for index, (
         (cx, cy),
         ui_clutter,
-        scale,
         (background_kind, background_seed),
     ) in enumerate(
         zip(
             center_schedule,
             ui_clutter_schedule,
-            scale_schedule,
             background_schedule,
         )
     ):
@@ -1901,7 +2034,7 @@ def generate_samples(
             if center_mask is not None and not center_mask[ny - pad, nx - pad]:
                 nx, ny = cx, cy
 
-        patch = extract_roi(img, nx, ny, angle, safe_size, scale)
+        patch = extract_roi(img, nx, ny, angle, safe_size)
         if not is_valid(
             patch,
             min_map_circle_coverage=min_map_circle_coverage,
@@ -1910,7 +2043,6 @@ def generate_samples(
         ):
             nx, ny, angle = cx, cy, 0.0
             patch = extract_roi(img, cx, cy, 0, safe_size)
-            scale = 1.0
 
         if tier_context is not None:
             parent_patch = extract_roi(
@@ -1919,7 +2051,6 @@ def generate_samples(
                 ny,
                 angle,
                 safe_size,
-                scale,
             )
             patch = compose_tier_context_patch(
                 patch,
@@ -1945,7 +2076,6 @@ def generate_samples(
 
         train_only = (
             ui_clutter != UiClutter.NONE
-            or scale != 1.0
             or (
                 sample_region is not None
                 and occurrences[index] < clean_passes
@@ -1954,10 +2084,10 @@ def generate_samples(
         target = train_only_samples if train_only else samples
         target.append(sample)
 
-    if light_aug:
+    if center_ui_count:
         center_ui_plan = build_tier_center_ui_plan(
             valid_centers,
-            target_count,
+            center_ui_count,
         )
         center_ui_backgrounds = build_background_schedule(
             len(center_ui_plan),
@@ -1975,7 +2105,6 @@ def generate_samples(
                 0,
                 safe_size,
                 bg_paths,
-                1.0,
                 background_kind=background_kind,
                 background_seed=background_seed,
                 tier_context=tier_context,
@@ -1994,7 +2123,6 @@ def generate_samples(
     if random_sampling_only:
         return samples, train_only_samples
 
-    zone_count = round(target_count * CONFIG["UI_ZONE_EXTRA_RATIO"])
     zone_centers = (
         augmentation_centers if sample_region is not None else valid_centers
     )
@@ -2006,8 +2134,6 @@ def generate_samples(
 
     train_zone_ui_clutter = build_zone_ui_clutter_schedule(train_zone_plan)
     split_zone_ui_clutter = build_zone_ui_clutter_schedule(split_zone_plan)
-    train_zone_scales = build_scale_jitter_schedule(len(train_zone_plan))
-    split_zone_scales = build_scale_jitter_schedule(len(split_zone_plan))
     train_zone_backgrounds = build_background_schedule(
         len(train_zone_plan),
         stream=2,
@@ -2021,12 +2147,10 @@ def generate_samples(
     for (
         ((cx, cy), fill_color),
         ui_clutter,
-        scale,
         (background_kind, background_seed),
     ) in zip(
         train_zone_plan,
         train_zone_ui_clutter,
-        train_zone_scales,
         train_zone_backgrounds,
     ):
         patch_bgr = compose_patch(
@@ -2036,7 +2160,6 @@ def generate_samples(
             0,
             safe_size,
             bg_paths,
-            scale,
             background_kind=background_kind,
             background_seed=background_seed,
             tier_context=tier_context,
@@ -2046,12 +2169,10 @@ def generate_samples(
     for (
         ((cx, cy), fill_color),
         ui_clutter,
-        scale,
         (background_kind, background_seed),
     ) in zip(
         split_zone_plan,
         split_zone_ui_clutter,
-        split_zone_scales,
         split_zone_backgrounds,
     ):
         patch_bgr = compose_patch(
@@ -2061,15 +2182,19 @@ def generate_samples(
             0,
             safe_size,
             bg_paths,
-            scale,
             background_kind=background_kind,
             background_seed=background_seed,
             tier_context=tier_context,
         )
         sample = augment_zone_patch(patch_bgr, fill_color, ui_clutter)
-        train_only = ui_clutter != UiClutter.NONE or scale != 1.0
+        train_only = ui_clutter != UiClutter.NONE
         target = train_only_samples if train_only else samples
         target.append(finalize_positive_map_sample(sample))
+    if light_aug and len(samples) + len(train_only_samples) != target_count:
+        raise RuntimeError(
+            f"Tier sample budget mismatch: expected {target_count}, "
+            f"generated {len(samples) + len(train_only_samples)}"
+        )
     return samples, train_only_samples
 
 
@@ -2104,9 +2229,10 @@ def save_dataset(
         train_samples = train_only_samples
         val_samples = [random.choice(train_only_samples).copy()]
     else:
-        val_count = max(1, min(int(total * CONFIG["VAL_RATIO"]), len(samples)))
-        if not train_only_samples:
-            val_count = min(val_count, len(samples) - 1)
+        val_count = max(
+            1,
+            min(round(len(samples) * CONFIG["VAL_RATIO"]), len(samples) - 1),
+        )
         val_samples = samples[:val_count]
         train_samples = samples[val_count:] + train_only_samples
         random.shuffle(train_samples)
@@ -2235,10 +2361,11 @@ def process_image_task(
         }
 
     is_none = class_name == "None"
+    # Tier 未指定数量时由 generate_samples 按合法中心数确定。
     target_count = (
         target_count_override
-        if target_count_override is not None
-        else (CONFIG["TIER_TARGET_COUNT"] if is_tier else CONFIG["TARGET_COUNT"])
+        if target_count_override is not None or is_tier
+        else CONFIG["TARGET_COUNT"]
     )
     samples, train_only_samples = generate_samples(
         img,
@@ -2251,6 +2378,10 @@ def process_image_task(
         background_run_seed=background_run_seed,
     )
 
+    generated_count = len(samples) + len(train_only_samples)
+    if is_tier and not generated_count:
+        raise RuntimeError(f"Tier class has no valid centers: {class_name}")
+
     save_dataset(
         samples,
         class_name,
@@ -2259,7 +2390,10 @@ def process_image_task(
         train_only_samples,
     )
     return {
-        "message": f"Completed {class_name} ({file_path.name})",
+        "message": (
+            f"Completed {class_name} ({file_path.name}): "
+            f"{generated_count} generated, {len(train_only_samples)} train-only"
+        ),
         "tile_mapping": {},
     }
 
@@ -2486,11 +2620,11 @@ def parse_args() -> argparse.Namespace:
         help=f"普通类别目标样本数 (default: {CONFIG['TARGET_COUNT']})",
     )
     parser.add_argument(
-        "--tier-target-count",
-        dest="tier_target_count",
+        "--tier-max-count",
+        dest="tier_max_count",
         type=int,
         default=argparse.SUPPRESS,
-        help=f"Tier 类目标样本数 (default: {CONFIG['TIER_TARGET_COUNT']})",
+        help=f"Tier 类样本上限，实际数量随合法中心数增长 (default: {CONFIG['TIER_MAX_COUNT']})",
     )
     parser.add_argument(
         "--none-total-cap",

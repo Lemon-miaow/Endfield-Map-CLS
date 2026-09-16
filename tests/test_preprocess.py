@@ -22,14 +22,15 @@ from preprocess import (
     add_black_outline_rgba,
     add_error_training_samples,
     add_extreme_icon_clutter,
+    add_map_blur,
     add_tier_center_icon_cluster,
     apply_background_composition,
+    augment_patch,
     build_background_schedule,
     build_balanced_schedule,
     build_counterfactual_background_schedule,
     build_random_scene_background,
-    build_scale_jitter_schedule,
-    build_tier_center_mask,
+    build_map_center_mask,
     build_tier_center_ui_plan,
     build_ui_clutter_schedule,
     build_zone_plan,
@@ -37,6 +38,8 @@ from preprocess import (
     copy_fixed_validation_samples,
     compose_tier_context_patch,
     draw_random_ui_lines,
+    draw_zipline_arrows,
+    extract_roi,
     finalize_positive_map_sample,
     generate_samples,
     is_valid,
@@ -44,6 +47,8 @@ from preprocess import (
     safe_imwrite,
     sample_minimap_center,
     save_dataset,
+    split_tier_sample_budget,
+    tier_sample_count,
     tint_icon_blue_rgba,
 )
 
@@ -100,6 +105,16 @@ class BalancedSamplingTests(unittest.TestCase):
         self.assertEqual(tier_schedule.count(UiClutter.EXTREME), 12)
         self.assertEqual(tier_schedule.count(UiClutter.ULTRA), 3)
 
+        base_schedule = build_ui_clutter_schedule(800, 1200)
+        self.assertEqual(len(base_schedule), 800)
+        self.assertEqual(base_schedule.count(UiClutter.EXTREME), 51)
+        self.assertEqual(base_schedule.count(UiClutter.ULTRA), 10)
+
+        crowded = build_ui_clutter_schedule(30, 1200)
+        self.assertEqual(len(crowded), 30)
+        self.assertEqual(crowded.count(UiClutter.ULTRA), 10)
+        self.assertEqual(crowded.count(UiClutter.EXTREME), 20)
+
     def test_zone_ui_clutter_schedule_covers_yellow_and_blue(self) -> None:
         random.seed(7)
         plan = [((index, 0), ZONE_YELLOW_BGR) for index in range(50)]
@@ -116,19 +131,6 @@ class BalancedSamplingTests(unittest.TestCase):
         self.assertEqual(sum(level != UiClutter.NONE for level in blue), 8)
         self.assertEqual(yellow.count(UiClutter.ULTRA), 1)
         self.assertEqual(blue.count(UiClutter.ULTRA), 1)
-
-    def test_scale_jitter_schedule_is_balanced_and_keeps_clean_majority(self) -> None:
-        random.seed(7)
-
-        schedule = build_scale_jitter_schedule(1200)
-        smaller = [scale for scale in schedule if scale < 1.0]
-        larger = [scale for scale in schedule if scale > 1.0]
-
-        self.assertEqual(schedule.count(1.0), 900)
-        self.assertEqual(len(smaller), 150)
-        self.assertEqual(len(larger), 150)
-        self.assertGreaterEqual(min(smaller), CONFIG["SCALE_JITTER_MIN"])
-        self.assertLessEqual(max(larger), CONFIG["SCALE_JITTER_MAX"])
 
 
 class UiCompositionTests(unittest.TestCase):
@@ -151,6 +153,27 @@ class UiCompositionTests(unittest.TestCase):
         values = np.unique(result)
         self.assertGreater(values.size, 4)
         self.assertLess(int(result.max()), 255)
+
+    def test_zipline_arrows_form_cyan_directional_chain(self) -> None:
+        image = np.zeros((128, 128, 3), dtype=np.uint8)
+        random.seed(3)
+        forward = draw_zipline_arrows(image, [(20, 64), (107, 64)])
+        random.seed(3)
+        backward = draw_zipline_arrows(image, [(107, 64), (20, 64)])
+
+        core = cv2.cvtColor(forward, cv2.COLOR_BGR2GRAY) > 140
+        chevrons, _ = cv2.connectedComponents(core.astype(np.uint8))
+        self.assertGreaterEqual(chevrons - 1, 12)
+        self.assertLessEqual(chevrons - 1, 20)
+        bright = forward[core].astype(float)
+        self.assertGreater(bright[:, 0].mean() - bright[:, 2].mean(), 10)
+
+        # 箭头朝向随折线方向：反向折线等于正向结果的左右镜像，而正向结果本身左右不对称。
+        mirrored = forward[:, ::-1].astype(float)
+        asymmetry = np.abs(forward.astype(float) - mirrored).mean()
+        reverse_error = np.abs(backward.astype(float) - mirrored).mean()
+        self.assertGreater(asymmetry, 1.0)
+        self.assertLess(reverse_error, asymmetry * 0.25)
 
     def test_blue_tint_keeps_internal_dark_details(self) -> None:
         icon = np.zeros((3, 3, 4), dtype=np.uint8)
@@ -269,7 +292,33 @@ class UiCompositionTests(unittest.TestCase):
 
         self.assertGreater(np.count_nonzero(pointer_region), 0)
 
-    def test_base_keeps_two_counterfactual_passes_before_ui_augmentation(self) -> None:
+    def test_map_blur_softens_map_before_ui_icons(self) -> None:
+        yy, xx = np.indices((128, 128))
+        checker = np.where((xx + yy) % 2, 220, 30).astype(np.uint8)
+        image = np.repeat(checker[..., None], 3, axis=2)
+        ui_inputs = []
+
+        def detail(img: np.ndarray) -> float:
+            return float(cv2.Laplacian(img, cv2.CV_64F).var())
+
+        with (
+            patch.dict(
+                CONFIG,
+                {"MAP_BLUR_PROB": 1.0, "MAP_BLUR_SIGMA_MIN": 1.0, "MAP_BLUR_SIGMA_MAX": 1.0},
+            ),
+            patch(
+                "preprocess.add_central_ui_simulation",
+                side_effect=lambda img, **_: ui_inputs.append(img) or img,
+            ),
+        ):
+            augment_patch(image, 182, UiClutter.ULTRA)
+
+        self.assertEqual(len(ui_inputs), 1)
+        self.assertLess(detail(ui_inputs[0]), detail(image) * 0.5)
+        with patch.dict(CONFIG, {"MAP_BLUR_PROB": 0.0}):
+            np.testing.assert_array_equal(add_map_blur(image), image)
+
+    def test_base_keeps_one_clean_anchor_before_ui_augmentation(self) -> None:
         safe_size = 182
         pad = safe_size // 2
         size = 256
@@ -305,7 +354,7 @@ class UiCompositionTests(unittest.TestCase):
                 target_count=192,
             )
 
-        self.assertEqual(augment.call_count, 64)
+        self.assertEqual(augment.call_count, 128)
         self.assertEqual(
             Counter(call.args[2] for call in compose.call_args_list),
             Counter(
@@ -319,39 +368,132 @@ class UiCompositionTests(unittest.TestCase):
 
 
 class TierSamplingTests(unittest.TestCase):
-    def test_center_ui_plan_covers_every_center_and_balances_zones(self) -> None:
+    def test_tier_budget_restores_august_mix_and_center_coverage(self) -> None:
+        self.assertEqual(split_tier_sample_budget(1000, 15), (588, 294, 118))
+        self.assertEqual(split_tier_sample_budget(1000, 290), (405, 203, 392))
+        for center_count in (15, 56, 104, 290, 600):
+            primary, zone, center = split_tier_sample_budget(1000, center_count)
+            self.assertEqual(primary + zone + center, 1000)
+            self.assertLessEqual(abs(primary - 2 * zone), 1)
+            self.assertGreaterEqual(center, center_count)
+        with self.assertRaises(ValueError):
+            split_tier_sample_budget(1000, 1000)
+
+    def test_tier_budget_scales_with_center_count(self) -> None:
+        self.assertEqual(tier_sample_count(3), 510)
+        self.assertEqual(tier_sample_count(100), 600)
+        self.assertEqual(tier_sample_count(289), 1000)
+        for center_count in (1, 15, 85, 166, 494):
+            total = tier_sample_count(center_count)
+            primary, zone, center = split_tier_sample_budget(total, center_count)
+            self.assertEqual(primary + zone + center, total)
+            self.assertGreaterEqual(center, center_count)
+
+    def test_tier_without_explicit_count_uses_center_scaled_budget(self) -> None:
+        random.seed(7)
+        safe_size = 182
+        pad = safe_size // 2
+        image = np.full((64, 64, 4), (62, 62, 62, 255), dtype=np.uint8)
+        mask = np.zeros((64, 64), dtype=bool)
+        mask[24:40, 24:40] = True
+        image = cv2.copyMakeBorder(image, pad, pad, pad, pad, cv2.BORDER_CONSTANT)
+
+        with (
+            patch("preprocess.is_valid", return_value=True),
+            patch("preprocess.augment_patch_light", side_effect=lambda img, *_: img),
+            patch("preprocess.augment_zone_patch", side_effect=lambda img, *_: img),
+            patch("preprocess.finalize_positive_map_sample", side_effect=lambda img: img),
+        ):
+            samples, train_only = generate_samples(
+                image, safe_size, [], light_aug=True,
+                tier_context={"parent_aligned": np.zeros_like(image), "mask_mode": "opaque", "center_mask": mask},
+            )
+
+        self.assertEqual(len(samples) + len(train_only), tier_sample_count(4))
+
+    def test_center_ui_plan_obeys_quota_and_balances_zones(self) -> None:
         random.seed(7)
         centers = [(index, 0) for index in range(100)]
 
-        plan = build_tier_center_ui_plan(centers, target_count=20)
+        plan = build_tier_center_ui_plan(centers, sample_count=20)
         colors = [color for _center, color in plan]
 
-        self.assertEqual(len(plan), 100)
-        self.assertEqual({center for center, _color in plan}, set(centers))
-        self.assertEqual(colors.count(ZONE_YELLOW_BGR), 49)
-        self.assertEqual(colors.count(ZONE_BLUE_BGR), 16)
-        self.assertEqual(colors.count(None), 35)
+        self.assertEqual(len(plan), 20)
+        self.assertEqual(len({center for center, _color in plan}), 20)
+        self.assertEqual(colors.count(ZONE_YELLOW_BGR), 10)
+        self.assertEqual(colors.count(ZONE_BLUE_BGR), 3)
+        self.assertEqual(colors.count(None), 7)
 
     def test_center_mask_keeps_only_structure_neighborhood(self) -> None:
         image = np.zeros((64, 64, 4), dtype=np.uint8)
         image[:8, :8, 3] = 255
         image[28:36, 28:36] = (255, 255, 255, 255)
 
-        mask = build_tier_center_mask(image)
+        mask = build_map_center_mask(image)
 
         self.assertTrue(mask[32, 32])
         self.assertFalse(mask[32, 24])
         self.assertFalse(mask[4, 4])
         self.assertFalse(mask[0, 63])
 
-    def test_center_mask_excludes_dimmed_parent_context(self) -> None:
-        image = np.full((64, 64, 4), (40, 40, 40, 255), dtype=np.uint8)
-        image[24:40, 24:40, :3] = 220
+    def test_base_center_mask_keeps_gray_shadow_and_excludes_black_hole(self) -> None:
+        image = np.full((64, 64, 4), (4, 4, 4, 255), dtype=np.uint8)
+        image[24:40, 24:40, :3] = 0
 
-        mask = build_tier_center_mask(image)
+        mask = build_map_center_mask(image)
 
-        self.assertFalse(mask[8, 8])
-        self.assertTrue(mask[32, 32])
+        self.assertTrue(mask[8, 8])
+        self.assertFalse(mask[32, 32])
+
+    def test_black_hole_filter_does_not_drop_existing_edge_tile(self) -> None:
+        safe_size = 182
+        pad = safe_size // 2
+        image = np.full((40, 40, 4), (40, 40, 40, 255), dtype=np.uint8)
+        image[0, :16, :3] = 0  # 25 个原始候选中心中排除两个黑洞，保留 23 个。
+        image = cv2.copyMakeBorder(image, pad, pad, pad, pad, cv2.BORDER_CONSTANT)
+        with (
+            patch("preprocess.is_valid", return_value=True),
+            patch.dict(CONFIG, {"UI_ZONE_EXTRA_RATIO": 0.0}),
+        ):
+            samples, train_only = generate_samples(
+                image, safe_size, [], sample_region=(0, 0, 40, 40), target_count=60,
+            )
+        self.assertEqual(len(samples) + len(train_only), 60)
+
+    def test_base_center_mask_rejects_transparent_rgb_residue(self) -> None:
+        image = np.full((64, 64, 4), (255, 255, 255, 0), dtype=np.uint8)
+        self.assertFalse(build_map_center_mask(image).any())
+
+    def test_all_tier_buckets_and_jitter_stay_on_foreground(self) -> None:
+        random.seed(7)
+        safe_size = 182
+        pad = safe_size // 2
+        parent = np.full((64, 64, 4), (240, 240, 240, 255), dtype=np.uint8)
+        parent[24:40, 24:40, :3] = 40
+        image = np.full_like(parent, (62, 62, 62, 255))
+        image[24:40, 24:40, :3] = 35
+        mask = np.zeros((64, 64), dtype=bool)
+        mask[24:40, 24:40] = True  # 原始前景掩码；不从更亮的烘焙 Base 反推。
+        image = cv2.copyMakeBorder(image, pad, pad, pad, pad, cv2.BORDER_CONSTANT)
+        parent = cv2.copyMakeBorder(parent, pad, pad, pad, pad, cv2.BORDER_CONSTANT)
+
+        with (
+            patch("preprocess.extract_roi", wraps=extract_roi) as crop,
+            patch("preprocess.is_valid", return_value=True),
+            patch("preprocess.augment_patch_light", side_effect=lambda img, *_: img),
+            patch("preprocess.augment_zone_patch", side_effect=lambda img, *_: img),
+            patch("preprocess.finalize_positive_map_sample", side_effect=lambda img: img),
+        ):
+            samples, train_only = generate_samples(
+                image, safe_size, [], target_count=60, light_aug=True,
+                tier_context={"parent_aligned": parent, "mask_mode": "opaque", "center_mask": mask},
+            )
+
+        self.assertEqual(len(samples) + len(train_only), 60)
+        for call in crop.call_args_list:
+            source, x, y, *_ = call.args
+            if source is image:
+                self.assertTrue(mask[y - pad, x - pad])
 
     def test_small_centered_tier_uses_tier_coverage_thresholds(self) -> None:
         image = np.zeros((128, 128, 4), dtype=np.uint8)
@@ -445,6 +587,14 @@ class TierSamplingTests(unittest.TestCase):
         self.assertNotEqual(first, next_run)
         self.assertLessEqual(max(counts.values()) - min(counts.values()), 1)
 
+    def test_tier_background_schedule_restores_august_equal_mix(self) -> None:
+        schedule = build_background_schedule(120, stream=3)
+        counts = Counter(kind for kind, _seed in schedule)
+
+        self.assertEqual(counts[BackgroundKind.BLACK], 40)
+        self.assertEqual(counts[BackgroundKind.TEXTURE], 40)
+        self.assertEqual(counts[BackgroundKind.STRUCTURED], 40)
+
     def test_procedural_background_is_repeatable_and_contains_fine_detail(self) -> None:
         texture = build_random_scene_background(
             128,
@@ -490,6 +640,7 @@ class TierSamplingTests(unittest.TestCase):
         safe_size = 182
         pad = safe_size // 2
         image = np.zeros((256 + pad * 2, 256 + pad * 2, 4), dtype=np.uint8)
+        image[pad : pad + 256, pad : pad + 256, :3] = 40
         image[pad : pad + 256, pad : pad + 256, 3] = 255
 
         def valid_for_clean_anchor(_image, **kwargs):
@@ -512,8 +663,8 @@ class TierSamplingTests(unittest.TestCase):
                 target_count=192,
             )
 
-        self.assertEqual(len(samples), 64)
-        self.assertEqual(len(train_only_samples), 128)
+        self.assertEqual(len(samples), 128)
+        self.assertEqual(len(train_only_samples), 64)
         augment.assert_not_called()
         augment_zone.assert_not_called()
 
@@ -521,6 +672,7 @@ class TierSamplingTests(unittest.TestCase):
         safe_size = 182
         pad = safe_size // 2
         image = np.zeros((256 + pad * 2, 256 + pad * 2, 4), dtype=np.uint8)
+        image[pad : pad + 256, pad : pad + 128, :3] = 40
         image[pad : pad + 256, pad : pad + 128, 3] = 255
         sampled_centers = []
 
@@ -551,7 +703,7 @@ class TierSamplingTests(unittest.TestCase):
         self.assertTrue(sampled_centers)
         self.assertTrue(all(x < 128 for x, _y in sampled_centers))
 
-    def test_center_icon_samples_are_train_only_and_keep_base_quota(self) -> None:
+    def test_center_icon_samples_are_train_only_and_stay_inside_tier_budget(self) -> None:
         safe_size = 182
         pad = safe_size // 2
         size = 192
@@ -570,15 +722,15 @@ class TierSamplingTests(unittest.TestCase):
         tier_context = {
             "parent_aligned": np.zeros(image.shape, dtype=np.uint8),
             "mask_mode": "opaque",
+            "center_mask": np.zeros((size, size), dtype=bool),
         }
+        tier_context["center_mask"][64:80, 64:80] = True
 
         with (
             patch.dict(
                 CONFIG,
                 {
-                    "TIER_CENTER_UI_EXTRA_RATIO": 0.20,
                     "UI_ZONE_EXTRA_RATIO": 0.0,
-                    "SCALE_JITTER_RATIO": 0.0,
                     "EXTREME_UI_PROB": 0.0,
                     "ULTRA_UI_PROB": 0.0,
                 },
@@ -620,8 +772,9 @@ class TierSamplingTests(unittest.TestCase):
                 tier_context=tier_context,
             )
 
-        self.assertEqual(len(samples), 20)
+        self.assertEqual(len(samples), 16)
         self.assertEqual(len(train_only_samples), 4)
+        self.assertEqual(len(samples) + len(train_only_samples), 20)
         self.assertTrue(
             all(
                 np.all(sample == int(UiClutter.TIER_CENTER))
@@ -636,7 +789,7 @@ class CuratedSampleTests(unittest.TestCase):
             output_dir = Path(temp_dir) / "dataset"
             split_samples = [np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(8)]
             protected_samples = [
-                np.full((8, 8, 3), 255, dtype=np.uint8) for _ in range(2)
+                np.full((8, 8, 3), 255, dtype=np.uint8) for _ in range(8)
             ]
 
             save_dataset(
@@ -653,7 +806,7 @@ class CuratedSampleTests(unittest.TestCase):
             val_paths = list(
                 (output_dir / "val" / "Map02Base__r16_c04").glob("*.jpg")
             )
-            self.assertEqual(len(train_paths), 8)
+            self.assertEqual(len(train_paths), 14)
             self.assertEqual(len(val_paths), 2)
             self.assertTrue(
                 all(float(cv2.imread(str(path)).mean()) < 1 for path in val_paths)

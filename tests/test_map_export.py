@@ -11,6 +11,7 @@ from preprocess import (
     CONFIG,
     build_tier_parent_context,
     compose_tier_context_patch,
+    decode_foreground_runs,
     get_safe_size,
     load_image,
     load_map_export_manifest,
@@ -32,7 +33,7 @@ class MapExportContractTests(unittest.TestCase):
             safe_imwrite(source / "Map02Lv002Tier255.png", tier)
 
             manifest = {
-                "format": "map-cls-export-v1",
+                "format": "map-cls-export-v2",
                 "bases": {
                     "Map02Base.png": {
                         "file": "Map02Base.png",
@@ -47,6 +48,7 @@ class MapExportContractTests(unittest.TestCase):
                         "parent_size": [16, 16],
                         "tier_to_parent": [1.0, 0.0, 1.0, 0.0],
                         "mask_mode": "opaque",
+                        "foreground_runs": [[18, 4], [26, 4], [34, 4], [42, 4]],
                     }
                 },
             }
@@ -57,6 +59,18 @@ class MapExportContractTests(unittest.TestCase):
 
             self.assertEqual(specs["Map02Lv002Tier255"]["parent_size"], (16, 16))
             self.assertEqual(specs["Map02Lv002Tier255"]["template_size"], (8, 8))
+            np.testing.assert_array_equal(
+                specs["Map02Lv002Tier255"]["center_mask"], tier[..., 3] > 0
+            )
+
+    def test_foreground_runs_reject_missing_and_invalid_masks(self) -> None:
+        for runs in (None, [], [[-1, 1]], [[0, 0]], [[3, 2]], [[0, 3], [2, 1]], [[True, 1]]):
+            with self.subTest(runs=runs), self.assertRaises(ValueError):
+                decode_foreground_runs(runs, (2, 2))
+
+    def test_foreground_mask_does_not_depend_on_baked_template_brightness(self) -> None:
+        mask = decode_foreground_runs([[0, 1], [3, 2]], (3, 2))
+        np.testing.assert_array_equal(mask, [[True, False, False], [True, True, False]])
 
     def test_tier_context_preserves_parent_as_transparent_layer(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -78,10 +92,12 @@ class MapExportContractTests(unittest.TestCase):
                 "parent_size": (64, 64),
                 "affine": (1.0, 16.0, 1.0, 16.0),
                 "mask_mode": "opaque",
+                "center_mask": template[..., 0] > 12,
             }
 
             padded_template = load_image(template_path, get_safe_size())
             context = build_tier_parent_context(padded_template, spec, get_safe_size())
+            np.testing.assert_array_equal(context["center_mask"], spec["center_mask"])
             output = compose_tier_context_patch(
                 padded_template,
                 context["parent_aligned"],
