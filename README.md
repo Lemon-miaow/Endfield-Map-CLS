@@ -106,7 +106,7 @@ python preprocess.py --input source_images --output dataset --error error_images
 
 同一类别的困难样本只加载一次，默认每张至少重复 5 次；当现场样本很少时，会补足到该类生成样本量的 5%，确保它们具有实际训练权重，同时避免进入随机验证集造成数据泄漏。
 
-固定真实验证样本放在 `validation_images/<class_name>/`，必须是已经按线上推理规格处理好的 128×128 图片。`preprocess.py` 会校验标签与尺寸并自动复制到 `dataset/val`；训练时它们会独立计算损失，与生成验证集共同决定 `best.pt` 和 early-stop。详细约束见 [`validation_images/README.md`](validation_images/README.md)。
+固定真实验证样本放在 `validation_images/<class_name>/`，必须是已经按线上推理规格处理好的 128×128 图片。`preprocess.py` 会校验标签与尺寸并自动复制到 `dataset/val`；训练时它们的平均损失和最差样本损失会与生成验证集共同决定 `best.pt` 和 early-stop。详细约束见 [`validation_images/README.md`](validation_images/README.md)。
 
 ### **4.模型训练**
 
@@ -115,6 +115,10 @@ python preprocess.py --input source_images --output dataset --error error_images
 ```bash
 python train.py --epochs 200 --batch 128 --device 0
 ```
+
+云 GPU 无人值守时加 `--shutdown`：早停、跑满轮数或异常退出后自动关机，避免空转计费；权重与 `results.csv` 每轮已落盘。
+
+训练默认开启 `torch.compile` 的 `reduce-overhead`（CUDA Graphs）：128px 小模型每步瓶颈在 Python 下发 GPU 算子，开启后 batch 与迭代次数不变，单步耗时约降 40%；启动时编译约 1 分钟，训练集丢弃每轮不足一个 batch 的尾部样本。排查问题时可用 `--compile False` 回到 eager。
 
 **💡 提示：** 首次训练自动挂载 `yolo26s-cls.pt`。增量微调时，引擎会自动寻址 `runs/classify/` 下最新的 `best.pt` 作为起点。
 
