@@ -66,6 +66,40 @@ CONFIG = {
     "MAP_BLUR_PROB": 0.30,              # 增强样本在叠加 UI 前模糊地图层的概率
     "MAP_BLUR_SIGMA_MIN": 0.4,
     "MAP_BLUR_SIGMA_MAX": 1.0,
+    # 实机地图层带亮度比例的块状斑驳（游戏对高分辨率贴图点采样），导出底图是平滑的。
+    # 27 张固定验证帧里把实机地图层做 σ1 模糊后 ctrl25 平均正确类得分 86→95（5571 13→95）；
+    # 反过来在合成地图层上加 σ0.12、2px 块的斑驳，99.8% 掉到 19.0%，与实机帧 16.6% 一致。
+    "MAP_MOTTLE_PROB": 0.50,
+    "MAP_MOTTLE_SIGMA_MIN": 0.04,
+    "MAP_MOTTLE_SIGMA_MAX": 0.15,
+    "MAP_MOTTLE_BLOCK_MAX": 2,
+    # 实机每帧都有相机视野扇形：从玩家点发出的白色半透明扇面，画在地图层之上、图标之下，方向与指针无关。
+    # 7 张已定位实机帧拟合：半角 25–35°，顶点 α 0.40–0.60，沿半径线性淡出到 30–48px。
+    # 训练集没有它时模型对它的反应忽正忽负：同一帧抹掉扇形，ep52 best +11pp、last −22pp；
+    # 27 张实机帧再叠一个扇形平均 −6pp。
+    "VIEW_CONE_PROB": 0.85,
+    "VIEW_CONE_HALF_ANGLE_MIN": 25.0,
+    "VIEW_CONE_HALF_ANGLE_MAX": 36.0,
+    "VIEW_CONE_RADIUS_MIN": 30.0,
+    "VIEW_CONE_RADIUS_MAX": 48.0,
+    "VIEW_CONE_ALPHA_MIN": 0.35,
+    "VIEW_CONE_ALPHA_MAX": 0.60,
+    # 实机透明区透出的是被小地图底板压暗的场景：5 张透明帧里 4 张亮度均值 27–38、标准差 8–9。
+    # 背景均值在 4–244 均匀取时落在这个带的只有约一成，而 Tier 样本四周恒为 0.28 倍暗父图，
+    # "暗色有纹理的四周"成了 Tier 线索；实机帧透出区换成均值 30 的程序化背景即复现下凹。
+    "SCENE_DARK_PROB": 0.50,
+    "SCENE_DARK_MEAN_MIN": 12.0,
+    "SCENE_DARK_MEAN_MAX": 60.0,
+    "SCENE_DARK_CONTRAST_MIN": 0.15,
+    "SCENE_DARK_CONTRAST_MAX": 0.60,
+    # 实机地图层相对导出底图是一次向中灰收拢的对比度压缩，图标保持纯白。14 张实机帧逐像素拟合：
+    # 增益 0.63–0.93、偏置 +5–+45，折算支点亮度 68–150。整图 HSV 扰动会连图标一起变暗，覆盖不到这种差异；
+    # 色调偏移与中心设施簇叠加曾把藏剑谷 Base 帧从 99% 打到 20%（issue 5833/5809）。
+    "MAP_TONE_PROB": 0.50,              # 增强样本在叠加 UI 前压缩地图层对比度的概率
+    "MAP_TONE_GAIN_MIN": 0.60,
+    "MAP_TONE_GAIN_MAX": 0.95,
+    "MAP_TONE_PIVOT_MIN": 70.0,
+    "MAP_TONE_PIVOT_MAX": 130.0,
     "TIER_MIN_MAP_CENTER_COVERAGE": 0.15,  # Tier 中心区域最低地图覆盖率
     "STD_THRESHOLD": 5.0,              # 保留兼容字段，实际有效性使用 MIN_VALID_STD
     "OCCLUSION_COUNT": 0,              # 保留兼容字段
@@ -122,6 +156,26 @@ CONFIG = {
     "ULTRA_UI_RADIUS_MIN": 16,
     "ULTRA_UI_RADIUS_MAX": 32,
     "ULTRA_UI_CHAIN_PROB": 0.85,
+    # 中心设施簇：玩家在淤积点、矿点周围扎堆建设施，十几个同类图标挤在指针 30px 内，约占圆内 1/4。
+    # 配额从普通样本里划出，密集与超密集的数量保持原样。
+    "CENTER_UI_PROB": 0.04,
+    "CENTER_UI_ICONS_MIN": 12,
+    "CENTER_UI_ICONS_MAX": 32,
+    "CENTER_UI_TYPES_MIN": 2,
+    "CENTER_UI_TYPES_MAX": 4,
+    "CENTER_UI_SPREAD_MIN": 8.0,
+    "CENTER_UI_SPREAD_MAX": 16.0,
+    "CENTER_UI_SCALE_MAX": 1.30,
+    "CENTER_UI_OFFSET": 8,
+    # 供电桩之间的电线：暗黄半透明 1px 直线，压在图标下方。issue 5571 的洞穴帧图标占圆 33%，
+    # 再叠 136px 电线后 Tier109 掉到 12%，单抹电线回到 60%。
+    "CENTER_UI_WIRE_PROB": 0.60,
+    "CENTER_UI_WIRES_MIN": 2,
+    "CENTER_UI_WIRES_MAX": 5,
+    "CENTER_UI_WIRE_ALPHA_MIN": 0.40,
+    "CENTER_UI_WIRE_ALPHA_MAX": 0.80,
+    # Tier 中心图标簇里改用设施簇的比例；Tier 的 CENTER 配额每类只有十几张，洞穴类靠这里补足。
+    "TIER_CENTER_FACILITY_PROB": 0.35,
     "TIER_CENTER_UI_EXTRA_RATIO": 0.20,
     "TIER_CENTER_UI_ICONS_MIN": 5,
     "TIER_CENTER_UI_ICONS_MAX": 8,
@@ -147,6 +201,7 @@ class UiClutter(IntEnum):
     EXTREME = 1
     ULTRA = 2
     TIER_CENTER = 3
+    CENTER = 4
 
 
 class BackgroundKind(IntEnum):
@@ -628,6 +683,68 @@ def add_extreme_icon_clutter(
     return out
 
 
+def add_center_facility_cluster(
+    result: np.ndarray,
+    normal_icons: dict,
+    icon_names: list[str],
+) -> np.ndarray:
+    """在玩家指针周围叠加少数几种设施图标的密集簇，模拟玩家扎堆建造。"""
+    if not icon_names:
+        return result
+
+    type_count = min(
+        len(icon_names),
+        random.randint(CONFIG["CENTER_UI_TYPES_MIN"], CONFIG["CENTER_UI_TYPES_MAX"]),
+    )
+    names = random.sample(icon_names, type_count)
+    count = random.randint(CONFIG["CENTER_UI_ICONS_MIN"], CONFIG["CENTER_UI_ICONS_MAX"])
+    spread = random.uniform(CONFIG["CENTER_UI_SPREAD_MIN"], CONFIG["CENTER_UI_SPREAD_MAX"])
+    offset = CONFIG["CENTER_UI_OFFSET"]
+    h, w = result.shape[:2]
+    cx = w // 2 + random.randint(-offset, offset)
+    cy = h // 2 + random.randint(-offset, offset)
+    placed = []
+    for _ in range(count):
+        icon = _sample_normal_ui_icon(
+            normal_icons,
+            icon_names,
+            name=random.choice(names),
+            scale_multiplier=random.uniform(1.0, CONFIG["CENTER_UI_SCALE_MAX"]),
+        )
+        placed.append(
+            (
+                icon,
+                cx + round(random.gauss(0, spread)),
+                cy + round(random.gauss(0, spread)),
+            )
+        )
+
+    out = draw_facility_wires(result, [(x, y) for _, x, y in placed])
+    for icon, x, y in placed:
+        ih, iw = icon.shape[:2]
+        out = draw_one_normal_icon(out, icon, x - iw // 2, y - ih // 2)
+    return out
+
+
+FACILITY_WIRE_BGR = (60, 190, 205)
+
+
+def draw_facility_wires(img: np.ndarray, anchors: list[tuple[int, int]]) -> np.ndarray:
+    """在设施之间画暗黄电线，一半连到簇外远端，与实机供电网一致。"""
+    if len(anchors) < 2 or random.random() >= CONFIG["CENTER_UI_WIRE_PROB"]:
+        return img.copy()
+
+    h, w = img.shape[:2]
+    wires = img.copy()
+    for _ in range(random.randint(CONFIG["CENTER_UI_WIRES_MIN"], CONFIG["CENTER_UI_WIRES_MAX"])):
+        start, end = random.sample(anchors, 2)
+        if random.random() < 0.5:
+            end = (random.randint(0, w - 1), random.randint(0, h - 1))
+        cv2.line(wires, start, end, FACILITY_WIRE_BGR, 1, lineType=cv2.LINE_AA)
+    alpha = random.uniform(CONFIG["CENTER_UI_WIRE_ALPHA_MIN"], CONFIG["CENTER_UI_WIRE_ALPHA_MAX"])
+    return cv2.addWeighted(wires, alpha, img, 1.0 - alpha, 0)
+
+
 def add_tier_center_icon_cluster(
     result: np.ndarray,
     normal_icons: dict,
@@ -637,6 +754,8 @@ def add_tier_center_icon_cluster(
     """叠加靠近玩家指针的大号图标簇，覆盖真实 Tier 的中心遮挡。"""
     if not icon_names and not landmarks:
         return result
+    if icon_names and random.random() < CONFIG["TIER_CENTER_FACILITY_PROB"]:
+        return add_center_facility_cluster(result, normal_icons, icon_names)
 
     count = random.randint(
         CONFIG["TIER_CENTER_UI_ICONS_MIN"],
@@ -851,7 +970,9 @@ def add_random_map_icons(
 
             result = draw_one_normal_icon(result, icon, x, y)
 
-        if ui_clutter != UiClutter.NONE:
+        if ui_clutter == UiClutter.CENTER:
+            result = add_center_facility_cluster(result, normal_icons, icon_names)
+        elif ui_clutter != UiClutter.NONE:
             result = add_extreme_icon_clutter(
                 result,
                 normal_icons,
@@ -1240,12 +1361,58 @@ def add_photometric_distortion(img: np.ndarray) -> np.ndarray:
     return img
 
 
+def add_map_tone(img: np.ndarray) -> np.ndarray:
+    """在叠加 UI 前把地图层对比度向中灰支点收拢，图标保持原样，与实机渲染一致。"""
+    if random.random() >= CONFIG["MAP_TONE_PROB"]:
+        return img
+    gain = random.uniform(CONFIG["MAP_TONE_GAIN_MIN"], CONFIG["MAP_TONE_GAIN_MAX"])
+    pivot = random.uniform(CONFIG["MAP_TONE_PIVOT_MIN"], CONFIG["MAP_TONE_PIVOT_MAX"])
+    return cv2.convertScaleAbs(img, alpha=gain, beta=(1.0 - gain) * pivot)
+
+
 def add_map_blur(img: np.ndarray) -> np.ndarray:
     """在叠加 UI 前模糊地图层，让模型依赖粗粒度地形；图标保持清晰，与实机一致。"""
     if random.random() < CONFIG["MAP_BLUR_PROB"]:
         sigma = random.uniform(CONFIG["MAP_BLUR_SIGMA_MIN"], CONFIG["MAP_BLUR_SIGMA_MAX"])
         img = cv2.GaussianBlur(img, (0, 0), sigma)
     return img
+
+
+def add_map_mottle(img: np.ndarray) -> np.ndarray:
+    """在叠加 UI 前给地图层乘上 1–2px 块状亮度噪声，图标保持干净，与实机点采样纹理一致。"""
+    if random.random() >= CONFIG["MAP_MOTTLE_PROB"]:
+        return img
+    sigma = random.uniform(CONFIG["MAP_MOTTLE_SIGMA_MIN"], CONFIG["MAP_MOTTLE_SIGMA_MAX"])
+    block = random.randint(1, CONFIG["MAP_MOTTLE_BLOCK_MAX"])
+    h, w = img.shape[:2]
+    rng = np.random.default_rng(random.getrandbits(32))
+    noise = rng.normal(0.0, sigma, (h // block + 1, w // block + 1)).astype(np.float32)
+    noise = cv2.resize(noise, None, fx=block, fy=block, interpolation=cv2.INTER_NEAREST)[:h, :w]
+    if img.ndim == 3:
+        noise = noise[..., None]
+    return np.clip(img.astype(np.float32) * (1.0 + noise), 0, 255).astype(np.uint8)
+
+
+def add_view_cone(img: np.ndarray) -> np.ndarray:
+    """在叠加 UI 前画相机视野扇形：玩家点发出的白色半透明扇面，方向随机，沿半径线性淡出。"""
+    if random.random() >= CONFIG["VIEW_CONE_PROB"]:
+        return img
+    h, w = img.shape[:2]
+    direction = random.uniform(0.0, 360.0)
+    half_angle = random.uniform(CONFIG["VIEW_CONE_HALF_ANGLE_MIN"], CONFIG["VIEW_CONE_HALF_ANGLE_MAX"])
+    radius = random.uniform(CONFIG["VIEW_CONE_RADIUS_MIN"], CONFIG["VIEW_CONE_RADIUS_MAX"])
+    peak = random.uniform(CONFIG["VIEW_CONE_ALPHA_MIN"], CONFIG["VIEW_CONE_ALPHA_MAX"])
+
+    ys, xs = np.mgrid[:h, :w].astype(np.float32)
+    dx, dy = xs - w // 2, ys - h // 2
+    distance = np.hypot(dx, dy)
+    offset = np.abs((np.degrees(np.arctan2(dy, dx)) - direction + 180.0) % 360.0 - 180.0)
+    # 扇面两侧边缘留约 1px 的反走样过渡。
+    edge = np.clip((half_angle - offset) * np.radians(1.0) * np.maximum(distance, 1.0), 0.0, 1.0)
+    alpha = peak * np.clip(1.0 - distance / radius, 0.0, 1.0) * edge
+    if img.ndim == 3:
+        alpha = alpha[..., None]
+    return np.clip(img.astype(np.float32) * (1.0 - alpha) + 255.0 * alpha, 0, 255).astype(np.uint8)
 
 
 def apply_random_occlusion(patch: np.ndarray) -> np.ndarray:
@@ -1298,7 +1465,7 @@ def augment_patch(
     """对普通类别样本执行完整增强。"""
     if random.random() < 0.15:
         patch = add_photometric_distortion(patch)
-    patch = add_map_blur(patch)
+    patch = add_view_cone(add_map_mottle(add_map_blur(add_map_tone(patch))))
 
     if ui_clutter != UiClutter.NONE or random.random() < 0.85:
         patch = add_central_ui_simulation(patch, ui_clutter=ui_clutter)
@@ -1313,7 +1480,7 @@ def augment_patch_light(
     """对 Tier 类执行较轻增强，避免过度扰动小样本类别。"""
     if random.random() < 0.15:
         patch = add_photometric_distortion(patch)
-    patch = add_map_blur(patch)
+    patch = add_view_cone(add_map_mottle(add_map_blur(add_map_tone(patch))))
 
     if ui_clutter != UiClutter.NONE or random.random() < 0.85:
         patch = add_central_ui_simulation(patch, ui_clutter=ui_clutter)
@@ -1329,7 +1496,7 @@ def augment_zone_patch(
     """生成一个必定包含区域圈的额外地图样本。"""
     if random.random() < 0.15:
         patch = add_photometric_distortion(patch)
-    patch = add_map_blur(patch)
+    patch = add_view_cone(add_map_mottle(add_map_blur(add_map_tone(patch))))
 
     patch = draw_zone_overlay(patch, fill_color)
     if ui_clutter != UiClutter.NONE or random.random() < 0.85:
@@ -1540,6 +1707,9 @@ def build_random_scene_background(
     background = gray + (background - gray) * saturation
     contrast = float(rng.uniform(0.45, 1.75))
     target_mean = float(rng.uniform(4, 244))
+    if rng.random() < CONFIG["SCENE_DARK_PROB"]:
+        contrast = float(rng.uniform(CONFIG["SCENE_DARK_CONTRAST_MIN"], CONFIG["SCENE_DARK_CONTRAST_MAX"]))
+        target_mean = float(rng.uniform(CONFIG["SCENE_DARK_MEAN_MIN"], CONFIG["SCENE_DARK_MEAN_MAX"]))
     background = (background - background.mean()) * contrast + target_mean
 
     if rng.random() < 0.35:
@@ -1645,7 +1815,7 @@ def build_ui_clutter_schedule(
     sample_count: int,
     quota_count: int | None = None,
 ) -> list[UiClutter]:
-    """保持原密集比例，并将其中少量样本固定为超极端 UI。
+    """保持原密集比例，将其中少量样本固定为超极端 UI，并从普通样本里划出中心设施簇。
 
     quota_count 为计算密集配额所用的样本数，默认等于 sample_count；配额不超过可用位置。
     """
@@ -1657,11 +1827,17 @@ def build_ui_clutter_schedule(
     ultra_count = round(quota_count * 0.85 * CONFIG["ULTRA_UI_PROB"])
     if extreme_count:
         ultra_count = min(extreme_count, max(1, ultra_count))
+    # 中心设施簇只占用密集配额之外的普通位置，位置不足时让位给密集与超密集。
+    center_count = min(
+        sample_count - extreme_count,
+        round(quota_count * 0.85 * CONFIG["CENTER_UI_PROB"]),
+    )
 
     schedule = (
         [UiClutter.ULTRA] * ultra_count
         + [UiClutter.EXTREME] * (extreme_count - ultra_count)
-        + [UiClutter.NONE] * (sample_count - extreme_count)
+        + [UiClutter.CENTER] * center_count
+        + [UiClutter.NONE] * (sample_count - extreme_count - center_count)
     )
     random.shuffle(schedule)
     return schedule

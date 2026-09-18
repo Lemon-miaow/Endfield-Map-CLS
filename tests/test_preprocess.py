@@ -11,6 +11,8 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
+import preprocess
+
 from preprocess import (
     BackgroundKind,
     CONFIG,
@@ -22,7 +24,9 @@ from preprocess import (
     add_black_outline_rgba,
     add_error_training_samples,
     add_extreme_icon_clutter,
+    add_center_facility_cluster,
     add_map_blur,
+    add_map_tone,
     add_tier_center_icon_cluster,
     apply_background_composition,
     augment_patch,
@@ -96,12 +100,14 @@ class BalancedSamplingTests(unittest.TestCase):
         schedule = build_ui_clutter_schedule(1200)
 
         self.assertEqual(len(schedule), 1200)
-        self.assertEqual(schedule.count(UiClutter.NONE), 1139)
+        self.assertEqual(schedule.count(UiClutter.NONE), 1098)
+        self.assertEqual(schedule.count(UiClutter.CENTER), 41)
         self.assertEqual(schedule.count(UiClutter.EXTREME), 51)
         self.assertEqual(schedule.count(UiClutter.ULTRA), 10)
 
         tier_schedule = build_ui_clutter_schedule(300)
-        self.assertEqual(tier_schedule.count(UiClutter.NONE), 285)
+        self.assertEqual(tier_schedule.count(UiClutter.NONE), 275)
+        self.assertEqual(tier_schedule.count(UiClutter.CENTER), 10)
         self.assertEqual(tier_schedule.count(UiClutter.EXTREME), 12)
         self.assertEqual(tier_schedule.count(UiClutter.ULTRA), 3)
 
@@ -109,11 +115,13 @@ class BalancedSamplingTests(unittest.TestCase):
         self.assertEqual(len(base_schedule), 800)
         self.assertEqual(base_schedule.count(UiClutter.EXTREME), 51)
         self.assertEqual(base_schedule.count(UiClutter.ULTRA), 10)
+        self.assertEqual(base_schedule.count(UiClutter.CENTER), 41)
 
         crowded = build_ui_clutter_schedule(30, 1200)
         self.assertEqual(len(crowded), 30)
         self.assertEqual(crowded.count(UiClutter.ULTRA), 10)
         self.assertEqual(crowded.count(UiClutter.EXTREME), 20)
+        self.assertEqual(crowded.count(UiClutter.CENTER), 0)
 
     def test_zone_ui_clutter_schedule_covers_yellow_and_blue(self) -> None:
         random.seed(7)
@@ -127,8 +135,10 @@ class BalancedSamplingTests(unittest.TestCase):
         yellow = schedule[:50]
         blue = schedule[50:]
 
-        self.assertEqual(sum(level != UiClutter.NONE for level in yellow), 3)
-        self.assertEqual(sum(level != UiClutter.NONE for level in blue), 8)
+        self.assertEqual(sum(level in (UiClutter.EXTREME, UiClutter.ULTRA) for level in yellow), 3)
+        self.assertEqual(sum(level in (UiClutter.EXTREME, UiClutter.ULTRA) for level in blue), 8)
+        self.assertEqual(yellow.count(UiClutter.CENTER), 2)
+        self.assertEqual(blue.count(UiClutter.CENTER), 5)
         self.assertEqual(yellow.count(UiClutter.ULTRA), 1)
         self.assertEqual(blue.count(UiClutter.ULTRA), 1)
 
@@ -304,7 +314,7 @@ class UiCompositionTests(unittest.TestCase):
         with (
             patch.dict(
                 CONFIG,
-                {"MAP_BLUR_PROB": 1.0, "MAP_BLUR_SIGMA_MIN": 1.0, "MAP_BLUR_SIGMA_MAX": 1.0},
+                {"MAP_BLUR_PROB": 1.0, "MAP_BLUR_SIGMA_MIN": 1.0, "MAP_BLUR_SIGMA_MAX": 1.0, "MAP_TONE_PROB": 0.0, "MAP_MOTTLE_PROB": 0.0, "VIEW_CONE_PROB": 0.0},
             ),
             patch(
                 "preprocess.add_central_ui_simulation",
@@ -317,6 +327,130 @@ class UiCompositionTests(unittest.TestCase):
         self.assertLess(detail(ui_inputs[0]), detail(image) * 0.5)
         with patch.dict(CONFIG, {"MAP_BLUR_PROB": 0.0}):
             np.testing.assert_array_equal(add_map_blur(image), image)
+
+    def test_map_tone_compresses_map_layer_before_ui_and_keeps_icons_white(self) -> None:
+        image = np.zeros((128, 128, 3), dtype=np.uint8)
+        image[:, 64:] = 200
+        tone = {"MAP_TONE_PROB": 1.0, "MAP_TONE_GAIN_MIN": 0.7, "MAP_TONE_GAIN_MAX": 0.7,
+                "MAP_TONE_PIVOT_MIN": 100.0, "MAP_TONE_PIVOT_MAX": 100.0}
+
+        with patch.dict(CONFIG, tone):
+            toned = add_map_tone(image)
+        self.assertEqual(int(toned[0, 0, 0]), 30)
+        self.assertEqual(int(toned[0, 100, 0]), 170)
+
+        ui_inputs = []
+        with (
+            patch.dict(CONFIG, {**tone, "MAP_BLUR_PROB": 0.0, "MAP_MOTTLE_PROB": 0.0, "VIEW_CONE_PROB": 0.0}),
+            patch(
+                "preprocess.add_central_ui_simulation",
+                side_effect=lambda img, **_: ui_inputs.append(img.copy()) or np.full_like(img, 255),
+            ),
+        ):
+            sample = augment_patch(image, 182, UiClutter.CENTER)
+        self.assertEqual(int(ui_inputs[0][64, 100, 0]), 170)
+        self.assertEqual(int(sample[64, 64, 0]), 255)
+        with patch.dict(CONFIG, {"MAP_TONE_PROB": 0.0}):
+            np.testing.assert_array_equal(add_map_tone(image), image)
+
+    def test_center_facility_cluster_packs_few_icon_types_around_pointer(self) -> None:
+        random.seed(3)
+        image = np.full((128, 128, 3), 90, dtype=np.uint8)
+        icons = {name: np.full((120, 120, 4), 255, dtype=np.uint8) for name in "abcdefgh"}
+        used = []
+        real_sampler = preprocess._sample_normal_ui_icon
+
+        def spy(normal_icons, icon_names, name=None, scale_multiplier=1.0):
+            used.append(name)
+            return real_sampler(normal_icons, icon_names, name=name, scale_multiplier=scale_multiplier)
+
+        with patch.dict(CONFIG, {"CENTER_UI_WIRE_PROB": 0.0}), patch(
+            "preprocess._sample_normal_ui_icon", side_effect=spy
+        ):
+            out = add_center_facility_cluster(image, icons, list(icons))
+
+        changed = np.any(out != image, axis=2)
+        ys, xs = np.nonzero(changed)
+        self.assertTrue(CONFIG["CENTER_UI_ICONS_MIN"] <= len(used) <= CONFIG["CENTER_UI_ICONS_MAX"])
+        self.assertLessEqual(len(set(used)), CONFIG["CENTER_UI_TYPES_MAX"])
+        self.assertLess(abs(xs.mean() - 64), 16)
+        self.assertLess(abs(ys.mean() - 64), 16)
+        self.assertGreater(changed[24:104, 24:104].sum() / changed.sum(), 0.9)
+
+    def test_map_mottle_scales_with_brightness_and_keeps_black_background(self) -> None:
+        random.seed(11)
+        image = np.zeros((128, 128, 3), dtype=np.uint8)
+        image[:, 40:80] = 60
+        image[:, 80:] = 180
+
+        with patch.dict(CONFIG, {"MAP_MOTTLE_PROB": 1.0}):
+            out = preprocess.add_map_mottle(image)
+        with patch.dict(CONFIG, {"MAP_MOTTLE_PROB": 0.0}):
+            np.testing.assert_array_equal(preprocess.add_map_mottle(image), image)
+
+        self.assertEqual(int(out[:, :40].max()), 0)
+        dark_std = out[:, 40:80].astype(np.float32).std()
+        bright_std = out[:, 80:].astype(np.float32).std()
+        self.assertGreater(dark_std, 1.0)
+        self.assertGreater(bright_std, dark_std * 2)
+        self.assertLess(abs(out[:, 80:].astype(np.float32).mean() - 180), 4)
+
+    def test_view_cone_is_a_white_sector_fading_from_the_player(self) -> None:
+        random.seed(5)
+        image = np.full((128, 128, 3), 40, dtype=np.uint8)
+        cone = {
+            "VIEW_CONE_PROB": 1.0,
+            "VIEW_CONE_HALF_ANGLE_MIN": 30.0,
+            "VIEW_CONE_HALF_ANGLE_MAX": 30.0,
+            "VIEW_CONE_RADIUS_MIN": 40.0,
+            "VIEW_CONE_RADIUS_MAX": 40.0,
+            "VIEW_CONE_ALPHA_MIN": 0.5,
+            "VIEW_CONE_ALPHA_MAX": 0.5,
+        }
+
+        with patch.dict(CONFIG, cone), patch("preprocess.random.uniform", side_effect=[0.0, 30.0, 40.0, 0.5]):
+            out = preprocess.add_view_cone(image)
+        with patch.dict(CONFIG, {"VIEW_CONE_PROB": 0.0}):
+            np.testing.assert_array_equal(preprocess.add_view_cone(image), image)
+
+        # 方向 0° 指向 +x：近处亮、远处淡出，扇面外与半径外保持原样。
+        self.assertGreater(int(out[64, 74, 0]), int(out[64, 94, 0]))
+        self.assertGreater(int(out[64, 94, 0]), 40)
+        self.assertEqual(int(out[64, 110, 0]), 40)
+        self.assertEqual(int(out[64, 44, 0]), 40)
+        self.assertEqual(int(out[94, 64, 0]), 40)
+        self.assertEqual(len({int(v) for v in out[64, 84]}), 1)
+
+    def test_facility_wires_are_dim_yellow_lines_between_anchors(self) -> None:
+        random.seed(5)
+        image = np.full((128, 128, 3), 90, dtype=np.uint8)
+        anchors = [(40, 40), (88, 44), (60, 90), (70, 64)]
+
+        with patch.dict(CONFIG, {"CENTER_UI_WIRE_PROB": 1.0}):
+            out = preprocess.draw_facility_wires(image, anchors)
+        with patch.dict(CONFIG, {"CENTER_UI_WIRE_PROB": 0.0}):
+            untouched = preprocess.draw_facility_wires(image, anchors)
+
+        changed = np.any(out != image, axis=2)
+        self.assertTrue(np.array_equal(untouched, image))
+        self.assertGreater(changed.sum(), 40)
+        self.assertLess(changed.mean(), 0.05)
+        blue, green, red = out[changed].astype(int).mean(axis=0)
+        self.assertGreater(green, blue + 20)
+        self.assertGreater(red, blue + 20)
+        self.assertLess(out[changed].max(), 205)
+
+    def test_tier_center_cluster_switches_to_facility_cluster_by_probability(self) -> None:
+        image = np.full((128, 128, 3), 90, dtype=np.uint8)
+        icons = {"a": np.full((120, 120, 4), 255, dtype=np.uint8)}
+
+        with patch("preprocess.add_center_facility_cluster", return_value=image) as facility:
+            with patch.dict(CONFIG, {"TIER_CENTER_FACILITY_PROB": 1.0}):
+                preprocess.add_tier_center_icon_cluster(image, icons, ["a"], [])
+            self.assertEqual(facility.call_count, 1)
+            with patch.dict(CONFIG, {"TIER_CENTER_FACILITY_PROB": 0.0}):
+                preprocess.add_tier_center_icon_cluster(image, icons, ["a"], [])
+            self.assertEqual(facility.call_count, 1)
 
     def test_base_keeps_one_clean_anchor_before_ui_augmentation(self) -> None:
         safe_size = 182
@@ -595,6 +729,18 @@ class TierSamplingTests(unittest.TestCase):
         self.assertEqual(counts[BackgroundKind.TEXTURE], 40)
         self.assertEqual(counts[BackgroundKind.STRUCTURED], 40)
 
+    def test_half_of_scene_backgrounds_are_dark_and_low_contrast(self) -> None:
+        backgrounds = [
+            build_random_scene_background(128, 128, BackgroundKind.TEXTURE, seed)
+            for seed in range(200)
+        ]
+        dark = [bg for bg in backgrounds if 10 <= bg.mean() <= 62]
+
+        self.assertGreater(len(dark), 90)
+        self.assertLess(len(dark), 135)
+        self.assertLess(float(np.median([bg.std() for bg in dark])), 16)
+        self.assertGreater(sum(bg.mean() > 120 for bg in backgrounds), 30)
+
     def test_procedural_background_is_repeatable_and_contains_fine_detail(self) -> None:
         texture = build_random_scene_background(
             128,
@@ -733,6 +879,7 @@ class TierSamplingTests(unittest.TestCase):
                     "UI_ZONE_EXTRA_RATIO": 0.0,
                     "EXTREME_UI_PROB": 0.0,
                     "ULTRA_UI_PROB": 0.0,
+                    "CENTER_UI_PROB": 0.0,
                 },
             ),
             patch(
