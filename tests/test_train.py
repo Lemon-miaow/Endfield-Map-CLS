@@ -57,6 +57,16 @@ class TrainingGeometryTests(unittest.TestCase):
             }
         )
 
+    def test_center_zoom_exact_branch_keeps_pixels_uninterpolated(self) -> None:
+        random.seed(4)
+        pixels = np.random.default_rng(0).integers(0, 255, (128, 128, 3), dtype=np.uint8)
+        masked = CenterZoom().apply(pixels, 1.0)
+        transform = CenterZoom(shift_max=0, hflip_prob=0.0, exact_prob=1.0)
+
+        out = np.asarray(transform(Image.fromarray(pixels)))
+
+        np.testing.assert_array_equal(out, masked)
+
     def test_training_zooms_around_player_inside_minimap_mask(self) -> None:
         dataset = self.trainer.build_dataset(str(self.root))
 

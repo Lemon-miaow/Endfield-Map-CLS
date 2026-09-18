@@ -184,6 +184,10 @@ ONLINE_ZOOM_AREA = (0.7, 1.0)
 # 九月改成静态像素后，模型在实机渲染差异（滑索链、光晕、插值）上明显更敏感。
 # 6px 小于均衡滑窗步长 8px 的一个 tile，Base 中心仍落在本 tile 内，Tier 中心几乎不会离开高亮区。
 ONLINE_SHIFT_MAX = 6
+# 不放大、整数像素平移的比例：这一支不经过双线性插值，像素原样进网络。
+# 放大支路会把地图层 1–2px 的斑驳纹理抹平（高频 RMS 16.8→12.9，低于干净底图的 14.0），
+# 而实机帧是未经插值的原始像素；保留一部分原样像素，模型才见得到实机强度的纹理。
+ONLINE_EXACT_PROB = 0.4
 # 镜像在实机不存在，但八月的翻转训练让模型学到与像素排布无关的结构特征：
 # 翻转判别 Aug11 97%、Sep07 47%，稳的模型恰好是翻转不变的，所以按八月概率恢复。
 ONLINE_HFLIP_PROB = 0.5
@@ -204,10 +208,12 @@ class CenterZoom:
         area: tuple[float, float] = ONLINE_ZOOM_AREA,
         shift_max: int = ONLINE_SHIFT_MAX,
         hflip_prob: float = ONLINE_HFLIP_PROB,
+        exact_prob: float = ONLINE_EXACT_PROB,
     ):
         self.area = area
         self.shift_max = shift_max
         self.hflip_prob = hflip_prob
+        self.exact_prob = exact_prob
         # 与 preprocess.apply_minimap_mask 逐像素一致，变换后圆外溢出的地图内容重新清零。
         self.mask = np.zeros((MINIMAP_CENTER * 2, MINIMAP_CENTER * 2), dtype=np.uint8)
         cv2.circle(self.mask, (MINIMAP_CENTER, MINIMAP_CENTER), MINIMAP_RADIUS, 255, -1)
@@ -217,6 +223,8 @@ class CenterZoom:
         dx = random.uniform(-self.shift_max, self.shift_max)
         dy = random.uniform(-self.shift_max, self.shift_max)
         flip = random.random() < self.hflip_prob
+        if random.random() < self.exact_prob:
+            zoom, dx, dy = 1.0, float(round(dx)), float(round(dy))
         return Image.fromarray(self.apply(np.asarray(image), zoom, dx, dy, flip))
 
     def apply(
