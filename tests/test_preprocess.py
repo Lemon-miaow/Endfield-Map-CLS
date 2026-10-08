@@ -20,6 +20,7 @@ from preprocess import (
     UiClutter,
     ZONE_BLUE_BGR,
     ZONE_YELLOW_BGR,
+    _crop_scene_frame,
     _sample_normal_ui_icon,
     add_black_outline_rgba,
     add_error_training_samples,
@@ -28,6 +29,8 @@ from preprocess import (
     add_map_blur,
     add_map_tone,
     add_tier_center_icon_cluster,
+    allocate_none_counts,
+    allocate_scene_none_counts,
     apply_background_composition,
     augment_patch,
     build_background_schedule,
@@ -40,6 +43,7 @@ from preprocess import (
     build_zone_plan,
     build_zone_ui_clutter_schedule,
     copy_fixed_validation_samples,
+    discover_scene_paths,
     compose_tier_context_patch,
     draw_random_ui_lines,
     draw_zipline_arrows,
@@ -499,6 +503,11 @@ class UiCompositionTests(unittest.TestCase):
                 }
             ),
         )
+        # 干净锚点保持纯地图层，进入增强的出现才叠实机圆边透出。
+        self.assertEqual(
+            Counter(call.kwargs.get("rim_fade", False) for call in compose.call_args_list),
+            Counter({False: 64, True: 128}),
+        )
 
 
 class TierSamplingTests(unittest.TestCase):
@@ -646,6 +655,37 @@ class TierSamplingTests(unittest.TestCase):
             )
         )
 
+    def test_rim_fade_reveals_same_background_on_outer_ring(self) -> None:
+        random.seed(3)
+        image = np.full((128, 128, 4), (30, 30, 30, 255), dtype=np.uint8)
+        background = np.full((128, 128, 3), 200, dtype=np.uint8)
+        rim = {
+            "RIM_FADE_PROB": 1.0,
+            "RIM_FADE_START_MIN": 40.0,
+            "RIM_FADE_START_MAX": 40.0,
+            "RIM_FADE_PEAK_MIN": 1.0,
+            "RIM_FADE_PEAK_MAX": 1.0,
+        }
+
+        with patch("preprocess.build_random_scene_background", return_value=background):
+            with patch.dict(CONFIG, rim):
+                faded = apply_background_composition(image, [], BackgroundKind.TEXTURE, seed=7, rim_fade=True)
+                plain = apply_background_composition(image, [], BackgroundKind.TEXTURE, seed=7)
+                darkened = apply_background_composition(image, [], BackgroundKind.BLACK, rim_fade=True)
+            with patch.dict(CONFIG, {**rim, "RIM_FADE_PROB": 0.0}):
+                skipped = apply_background_composition(image, [], BackgroundKind.TEXTURE, seed=7, rim_fade=True)
+
+        self.assertTrue(np.all(plain == 30))
+        np.testing.assert_array_equal(skipped, plain)
+        # r40 以内保持地图层；r52 透出 ((52-40)/17.5)^2≈47%，30→110；越往外越亮，黑底则压暗。
+        self.assertEqual(int(faded[64, 64, 0]), 30)
+        self.assertEqual(int(faded[64, 64 + 39, 0]), 30)
+        self.assertLess(abs(int(faded[64, 64 + 52, 0]) - 110), 3)
+        self.assertGreater(int(faded[64 + 52, 64, 0]), int(faded[64 + 46, 64, 0]))
+        self.assertGreater(int(faded[64 + 46, 64, 0]), 30)
+        self.assertLess(int(darkened[64, 64 + 52, 0]), 20)
+        self.assertEqual(int(darkened[64, 64 + 39, 0]), 30)
+
     def test_background_composition_preserves_black_baseline(self) -> None:
         image = np.zeros((32, 32, 4), dtype=np.uint8)
         image[8:24, 8:24] = (30, 60, 90, 255)
@@ -684,7 +724,60 @@ class TierSamplingTests(unittest.TestCase):
             BackgroundKind.TEXTURE,
             7,
             [],
+            None,
         )
+
+    def test_scene_background_is_native_scale_window_of_real_frame(self) -> None:
+        frame = np.random.default_rng(3).integers(0, 256, (720, 1280, 3), dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "world" / "scene.png"
+            path.parent.mkdir()
+            safe_imwrite(path, frame)
+            preprocess._load_scene_frame.cache_clear()
+            crop = _crop_scene_frame(128, 128, [path], np.random.default_rng(5)).astype(np.uint8)
+            preprocess._load_scene_frame.cache_clear()
+
+        # 随机帧里与左上角像素同色的位置极少，先筛候选再逐个比对，免得整张展开滑窗（~31 GiB）
+        def contains(patch: np.ndarray) -> bool:
+            h, w = patch.shape[:2]
+            ys, xs = np.nonzero((frame[: frame.shape[0] - h + 1, : frame.shape[1] - w + 1] == patch[0, 0]).all(axis=2))
+            return any(np.array_equal(frame[y : y + h, x : x + w], patch) for y, x in zip(ys, xs))
+
+        self.assertTrue(contains(crop) or contains(crop[:, ::-1]))
+
+    def test_scene_background_is_shared_by_seed_and_replaces_noise(self) -> None:
+        frame = np.full((720, 1280, 3), (40, 160, 60), dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "world" / "scene.png"
+            path.parent.mkdir()
+            safe_imwrite(path, frame)
+            preprocess._load_scene_frame.cache_clear()
+            with patch.dict(CONFIG, {"SCENE_BACKGROUND_PROB": 1.0}):
+                first = build_random_scene_background(128, 128, BackgroundKind.TEXTURE, 7, [], [path])
+                again = build_random_scene_background(128, 128, BackgroundKind.TEXTURE, 7, [], [path])
+            preprocess._load_scene_frame.cache_clear()
+        noise = build_random_scene_background(128, 128, BackgroundKind.TEXTURE, 7)
+
+        self.assertTrue(np.array_equal(first, again))
+        self.assertFalse(np.array_equal(first, noise))
+
+    def test_scene_background_draws_groups_by_share(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = []
+            for group, count, value in (("world", 1, 50), ("zipline", 3, 200)):
+                (root / group).mkdir()
+                for index in range(count):
+                    path = root / group / f"{index}.png"
+                    safe_imwrite(path, np.full((230, 216, 3), value, dtype=np.uint8))
+                    paths.append(path)
+            preprocess._load_scene_frame.cache_clear()
+            rng = np.random.default_rng(9)
+            means = [_crop_scene_frame(128, 128, paths, rng).mean() for _ in range(2000)]
+            preprocess._load_scene_frame.cache_clear()
+
+        world_ratio = sum(mean < 100 for mean in means) / len(means)
+        self.assertAlmostEqual(world_ratio, CONFIG["SCENE_GROUP_SHARES"]["world"], delta=0.04)
 
     def test_counterfactual_schedule_covers_three_backgrounds_per_center(self) -> None:
         centers = [(0, 0), (1, 0)] * 3
@@ -1012,6 +1105,94 @@ class CuratedSampleTests(unittest.TestCase):
                 (output_dir / "val" / class_name / "fixed_regression.png").exists()
             )
 
+    def test_scene_frames_keep_native_scale_and_reject_crops_below_safe_size(self) -> None:
+        frame = np.random.default_rng(4).integers(0, 256, (230, 480, 3), dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "scene.png"
+            small = Path(temp_dir) / "small.png"
+            safe_imwrite(path, frame)
+            safe_imwrite(small, frame[:120])
+            preprocess._load_scene_frame.cache_clear()
+            loaded = preprocess._load_scene_frame(str(path))
+            with self.assertRaises(ValueError):
+                preprocess._load_scene_frame(str(small))
+            preprocess._load_scene_frame.cache_clear()
+
+        self.assertTrue(np.array_equal(loaded, frame))
+
+    def test_none_sample_circle_stays_inside_source(self) -> None:
+        random.seed(11)
+        safe_size = 182
+        pad = safe_size // 2
+        image = np.random.default_rng(11).integers(40, 220, (230, 480, 4), dtype=np.uint8)
+        image[..., 3] = 255
+        image = cv2.copyMakeBorder(image, pad, pad, pad, pad, cv2.BORDER_CONSTANT)
+        radius = CONFIG["MASK_DIAMETER"] // 2
+
+        with (
+            patch("preprocess.extract_roi", wraps=extract_roi) as crop,
+            patch("preprocess.augment_patch", side_effect=lambda img, *_: img),
+        ):
+            samples, train_only = generate_samples(
+                image, safe_size, [], target_count=40, random_sampling_only=True,
+            )
+
+        self.assertEqual(len(samples) + len(train_only), 40)
+        for call in crop.call_args_list:
+            _source, x, y, *_ = call.args
+            self.assertTrue(radius <= x - pad <= 480 - radius)
+            self.assertTrue(radius <= y - pad <= 230 - radius)
+
+    def test_scene_none_budget_is_split_evenly_across_frames(self) -> None:
+        files = [Path(f"scene_{i:02d}.png") for i in range(21)]
+
+        counts = allocate_none_counts(files, 1500)
+
+        self.assertEqual(sum(count for _path, count in counts), 1500)
+        self.assertEqual({count for _path, count in counts}, {71, 72})
+
+        many = [Path(f"scene_{i:03d}.png") for i in range(135)]
+        counts = allocate_none_counts(many, 1500, min_per_file=1)
+
+        self.assertEqual(sum(count for _path, count in counts), 1500)
+        self.assertEqual({count for _path, count in counts}, {11, 12})
+
+    def test_scene_none_budget_is_split_by_group_share_then_per_frame(self) -> None:
+        world = [Path("scene_images/world") / f"{i:02d}.png" for i in range(65)]
+        zipline = [Path("scene_images/zipline") / f"{i:02d}.png" for i in range(50)]
+
+        counts = dict(allocate_scene_none_counts(world + zipline, 1500))
+
+        self.assertEqual(sum(counts.values()), 1500)
+        self.assertEqual(sum(counts[path] for path in world), 1125)
+        self.assertEqual(sum(counts[path] for path in zipline), 375)
+        self.assertEqual({counts[path] for path in world}, {17, 18})
+        self.assertEqual({counts[path] for path in zipline}, {7, 8})
+
+        only_world = dict(allocate_scene_none_counts(world, 1500))
+        self.assertEqual(sum(only_world.values()), 1500)
+
+    def test_scene_discovery_requires_known_group_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for group in ("world", "zipline"):
+                (root / group).mkdir()
+                safe_imwrite(root / group / "a.png", np.zeros((200, 200, 3), dtype=np.uint8))
+            (root / ".DS_Store").write_bytes(b"")
+
+            found = discover_scene_paths(root)
+
+            safe_imwrite(root / "stray.png", np.zeros((200, 200, 3), dtype=np.uint8))
+            with self.assertRaises(ValueError):
+                discover_scene_paths(root)
+            (root / "stray.png").unlink()
+            (root / "unknown").mkdir()
+            with self.assertRaises(ValueError):
+                discover_scene_paths(root)
+
+        self.assertEqual([path.parent.name for path in found], ["world", "zipline"])
+        self.assertEqual(discover_scene_paths(None), [])
+
     def test_fixed_validation_rejects_unprocessed_screenshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1029,6 +1210,69 @@ class CuratedSampleTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "must be 128x128"):
                 copy_fixed_validation_samples(fixed_dir, output_dir)
+
+
+class ParallelTaskTests(unittest.TestCase):
+    def test_base_maps_split_into_tile_tasks_and_none_goes_last(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            base_path = root / "Map01Base.png"
+            safe_imwrite(base_path, np.zeros((170, 330, 4), dtype=np.uint8))
+            (root / "Map02Base.png").write_bytes(b"not a png")
+            tasks = [
+                (root / "none.png", "None", 7),
+                (base_path, "Map01Base", None),
+                (root / "Map01Lv001Tier114.png", "Map01Lv001Tier114", None),
+                (root / "Map02Base.png", "Map02Base", None),
+            ]
+
+            expanded = preprocess.expand_base_tile_tasks(tasks)
+
+        tiles = preprocess.enumerate_base_tiles(170, 330, "Map01Base")
+        self.assertEqual(
+            [task[3] for task in expanded[: len(tiles)]],
+            tiles,
+        )
+        # 解码失败的 Base 保留整图任务，交给 process_image_task 报加载失败。
+        self.assertEqual(
+            [(task[1], task[3]) for task in expanded[len(tiles) :]],
+            [("Map01Lv001Tier114", None), ("Map02Base", None), ("None", None)],
+        )
+        self.assertEqual(expanded[-1][2], 7)
+
+    def test_tile_task_generates_only_its_own_tile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            base_path = root / "Map01Base.png"
+            safe_imwrite(base_path, np.zeros((170, 330, 4), dtype=np.uint8))
+            tile = preprocess.enumerate_base_tiles(170, 330, "Map01Base")[1]
+
+            with patch.object(
+                preprocess, "generate_samples", return_value=([], [])
+            ) as generate:
+                result = preprocess.process_image_task(
+                    base_path, "Map01Base", root / "dataset", [], tile=tile
+                )
+
+        generate.assert_called_once()
+        self.assertEqual(
+            generate.call_args.kwargs["sample_region"],
+            (tile["x"], tile["y"], tile["w"], tile["h"]),
+        )
+        self.assertEqual(list(result["tile_mapping"]), [tile["class_name"]])
+
+    def test_resized_icon_cache_returns_independent_copies(self) -> None:
+        icon = np.zeros((40, 40, 4), dtype=np.uint8)
+        icon[8:32, 8:32] = (30, 160, 220, 255)
+
+        first = preprocess.resize_rgba(icon, 0.5)
+        first[...] = 0
+        second = preprocess.resize_rgba(icon, 0.51)
+        other = preprocess.resize_rgba(icon.copy(), 0.5)
+
+        self.assertEqual(second.shape, (20, 20, 4))
+        self.assertTrue(np.any(second))
+        np.testing.assert_array_equal(second, other)
 
 
 if __name__ == "__main__":

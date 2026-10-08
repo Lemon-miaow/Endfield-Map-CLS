@@ -34,9 +34,15 @@ import math
 import os
 import random
 import shutil
+from collections import Counter
 from enum import IntEnum
 from functools import lru_cache
 from pathlib import Path
+
+# numpy 自带的 OpenBLAS 按核数开线程并给每个线程预先提交缓冲区：50.50 上光 import numpy、cv2
+# 就提交 504 MB，单线程只要 21 MB。预处理 17 个进程合计白占约 8 GB，把整机提交内存推到 94%。
+# 这里没有矩阵运算，每个进程各算各的，BLAS 单线程就够；spawn 出的子进程继承这个环境变量。
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 import cv2
 import numpy as np
@@ -58,6 +64,16 @@ CONFIG = {
     "NONE_CLASS_TOTAL_CAP": 3000,      # None 类总样本上限
     "NONE_PER_IMAGE_MIN": 40,          # 单张 None 图最小采样数
     "NONE_PER_IMAGE_MAX": 100,         # 单张 None 图最大采样数
+    # 实机看不到小地图时裁块落在 3D 大世界上：测试集 430 张无小地图帧 run0919 认错 29 张，
+    # 全是树叶、白花、青色工业设施这类与地图层同色系的画面；49 张 None 源图全是 UI 界面，没有大世界。
+    "NONE_SCENE_TOTAL_CAP": 1500,      # 大世界场景 None 样本总数，与 UI None 分开计数
+    # scene_images 按子目录分组，None 配额与透出底按同一份额抽组、组内均匀抽帧。
+    # world 是大世界整屏与 HUD 外裁块，留出 23 张线上认错 16，是主要缺口；
+    # zipline 是滑索滑行时推理区附近的裁块（滑行中小地图整个隐藏），线上 52 张认对 51，每张只覆盖推理区 ±55px。
+    "SCENE_GROUP_SHARES": {"world": 0.75, "zipline": 0.25},
+    # 同一批场景帧替换一半纹理/结构背景的程序化底，让地图类透明区也透出真实场景；
+    # 场景纹理在 None 与地图类里同时出现，判 None 只能依据有没有地图层。
+    "SCENE_BACKGROUND_PROB": 0.5,
     "VAL_RATIO": 0.2,                  # 验证集比例
     "STRIDE": 8,                       # 滑窗扫描步长
     "ANGLE_JITTER": 0.5,               # 随机旋转扰动角度
@@ -84,6 +100,16 @@ CONFIG = {
     "VIEW_CONE_RADIUS_MAX": 48.0,
     "VIEW_CONE_ALPHA_MIN": 0.35,
     "VIEW_CONE_ALPHA_MAX": 0.60,
+    # 实机小地图外圈的地图层逐渐变淡，透出后面的场景，图标与指针保持原样。21 张已定位 Win32 帧逐半径拟合
+    # （外环 r57.5）：r40 起透出，r44 约 7%、r47 14%、r49 23%、r51 35%、r53 遮罩边 51%，透出场景约为圈外亮度的 0.8 倍。
+    # 训练集这一圈恒为纯地图层；近黑 Base 格按此合成圆边后 best35 正确类均分 85→49，与实机圆边的 45 一致，
+    # 应龙关 r05_c06 实机帧就是图标簇叠上圆边透出被认成 r03_c09。透出底与透明区共用同一张背景，黑底样本外圈随之压暗。
+    "RIM_FADE_PROB": 0.85,
+    "RIM_FADE_START_MIN": 38.0,
+    "RIM_FADE_START_MAX": 42.0,
+    "RIM_FADE_WIDTH": 17.5,
+    "RIM_FADE_PEAK_MIN": 0.80,
+    "RIM_FADE_PEAK_MAX": 1.00,
     # 实机透明区透出的是被小地图底板压暗的场景：5 张透明帧里 4 张亮度均值 27–38、标准差 8–9。
     # 背景均值在 4–244 均匀取时落在这个带的只有约一成，而 Tier 样本四周恒为 0.28 倍暗父图，
     # "暗色有纹理的四周"成了 Tier 线索；实机帧透出区换成均值 30 的程序化背景即复现下凹。
@@ -215,6 +241,7 @@ DEFAULT_OPTIONS = {
     "output": "dataset",
     "error": "error_images",
     "bg": "bg_images",
+    "scene": "scene_images",
     "fixed_val": "validation_images",
     "map_export": "map_export.json",
     "workers": None,
@@ -226,6 +253,7 @@ CONFIG_OVERRIDES = {
     "none_total_cap": "NONE_CLASS_TOTAL_CAP",
     "none_per_image_min": "NONE_PER_IMAGE_MIN",
     "none_per_image_max": "NONE_PER_IMAGE_MAX",
+    "none_scene_total_cap": "NONE_SCENE_TOTAL_CAP",
     "val_ratio": "VAL_RATIO",
     "stride": "STRIDE",
     "error_oversample": "ERROR_OVERSAMPLE",
@@ -504,6 +532,12 @@ def tint_icon_blue_rgba(icon_rgba: np.ndarray, bgr_color=UI_BLUE_BGR) -> np.ndar
     return result
 
 
+# 图标缩放结果只取决于源图标、目标尺寸和插值方式，随机比例最后都落到少数几个整数尺寸上。
+# 每张样本贴七八个图标，逐个重算占了单张耗时的四分之一。调用方传的都是进程内常驻的图标数组，
+# 缓存里留着源数组的引用，按同一对象命中，结果返回副本。
+_resized_rgba_cache: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}
+
+
 def resize_rgba(icon_rgba: np.ndarray, scale: float, min_side: int | None = None) -> np.ndarray:
     h, w = icon_rgba.shape[:2]
     new_w = max(1, int(round(w * scale)))
@@ -515,6 +549,11 @@ def resize_rgba(icon_rgba: np.ndarray, scale: float, min_side: int | None = None
         new_h = int(round(new_h * factor))
 
     interpolation = cv2.INTER_AREA if scale <= 1.0 else cv2.INTER_LINEAR
+    key = (id(icon_rgba), new_w, new_h, interpolation)
+    cached = _resized_rgba_cache.get(key)
+    if cached is not None and cached[0] is icon_rgba:
+        return cached[1].copy()
+
     alpha = icon_rgba[..., 3].astype(np.float32) / 255.0
     premultiplied = icon_rgba[..., :3].astype(np.float32) * alpha[..., None]
     resized_alpha = cv2.resize(alpha, (new_w, new_h), interpolation=interpolation)
@@ -528,7 +567,8 @@ def resize_rgba(icon_rgba: np.ndarray, scale: float, min_side: int | None = None
         255,
     ).astype(np.uint8)
     result[..., 3] = np.clip(resized_alpha * 255, 0, 255).astype(np.uint8)
-    return result
+    _resized_rgba_cache[key] = (icon_rgba, result)
+    return result.copy()
 
 
 def overlay_rgba_on_bgr(dst_bgr: np.ndarray, icon_rgba: np.ndarray, x: int, y: int) -> np.ndarray:
@@ -1685,16 +1725,83 @@ def _add_map_distractor(
     )
 
 
+@lru_cache(maxsize=512)
+def _load_scene_frame(path: str) -> np.ndarray:
+    """按进程缓存场景帧，背景每次只裁一小块；源图已是 720p 尺度，原样使用。
+
+    缓存要装得下整个场景池（现 115 帧、解码后约 90 MB/进程），装不下时随机取帧近一半落空，
+    重新解码 PNG 占单张耗时约两成。
+    """
+    frame = safe_imread(path, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise ValueError(f"Failed to load scene frame: {path}")
+    safe_size = get_safe_size()
+    if min(frame.shape[:2]) < safe_size:
+        raise ValueError(f"Scene frame smaller than {safe_size}px: {path} {frame.shape[:2]}")
+    return frame
+
+
+@lru_cache(maxsize=4)
+def _scene_groups(scene_paths: tuple) -> tuple[tuple[float, tuple], ...]:
+    """按父目录分组，份额在现有组之间归一；None 配额与透出底共用这份分布。"""
+    groups: dict[str, list] = {}
+    for path in scene_paths:
+        groups.setdefault(Path(path).parent.name, []).append(path)
+    shares = CONFIG["SCENE_GROUP_SHARES"]
+    total = sum(shares[name] for name in groups)
+    return tuple((shares[name] / total, tuple(sorted(groups[name]))) for name in sorted(groups))
+
+
+def discover_scene_paths(scene_dir: Path | None) -> list[Path]:
+    """收集 SCENE_GROUP_SHARES 各子目录里的场景帧；根目录散放或不认识的子目录直接报错，免得悄悄漏掉。"""
+    if scene_dir is None or not scene_dir.exists():
+        return []
+    paths: list[Path] = []
+    for child in sorted(scene_dir.iterdir()):
+        if child.name.startswith("."):
+            continue
+        if not child.is_dir() or child.name not in CONFIG["SCENE_GROUP_SHARES"]:
+            raise ValueError(
+                f"Scene frames must live in group folders {sorted(CONFIG['SCENE_GROUP_SHARES'])}: {child}"
+            )
+        for ext in ["*.[pP][nN][gG]", "*.[jJ][pP][gG]"]:
+            paths.extend(child.glob(ext))
+    return sorted(paths)
+
+
+def _crop_scene_frame(
+    height: int,
+    width: int,
+    scene_paths: list,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """从真实大世界截图按原尺度随机裁一块，作为透明区透出的场景底。"""
+    groups = _scene_groups(tuple(scene_paths))
+    paths = groups[int(rng.choice(len(groups), p=[share for share, _paths in groups]))][1]
+    frame = _load_scene_frame(str(paths[int(rng.integers(0, len(paths)))]))
+    frame_height, frame_width = frame.shape[:2]
+    y = int(rng.integers(0, frame_height - height + 1))
+    x = int(rng.integers(0, frame_width - width + 1))
+    crop = frame[y : y + height, x : x + width]
+    if rng.random() < 0.5:
+        crop = cv2.flip(crop, 1)
+    return crop.astype(np.float32)
+
+
 def build_random_scene_background(
     height: int,
     width: int,
     kind: BackgroundKind = BackgroundKind.TEXTURE,
     seed: int | None = None,
     bg_paths: list | None = None,
+    scene_paths: list | None = None,
 ) -> np.ndarray:
-    """程序化生成跨亮度、颜色、频率和结构的游戏场景背景。"""
+    """以程序化噪声或真实场景为底，生成跨亮度、颜色、频率和结构的游戏场景背景。"""
     rng = np.random.default_rng(seed)
-    background = _multiscale_noise(height, width, rng)
+    if scene_paths and rng.random() < CONFIG["SCENE_BACKGROUND_PROB"]:
+        background = _crop_scene_frame(height, width, scene_paths, rng)
+    else:
+        background = _multiscale_noise(height, width, rng)
     if kind == BackgroundKind.STRUCTURED:
         background = _add_scene_structures(background, rng)
         background = _add_map_distractor(background, bg_paths or [], rng)
@@ -1721,18 +1828,32 @@ def build_random_scene_background(
     return np.clip(background, 0, 255).astype(np.uint8)
 
 
+def build_rim_fade(size: int) -> np.ndarray:
+    """实机小地图外圈地图层的透出比例：从起点半径按平方增长，遮罩边约透出一半。"""
+    start = random.uniform(CONFIG["RIM_FADE_START_MIN"], CONFIG["RIM_FADE_START_MAX"])
+    peak = random.uniform(CONFIG["RIM_FADE_PEAK_MIN"], CONFIG["RIM_FADE_PEAK_MAX"])
+    ys, xs = np.mgrid[:size, :size].astype(np.float32)
+    distance = np.hypot(xs - size // 2, ys - size // 2)
+    ramp = np.clip((distance - start) / CONFIG["RIM_FADE_WIDTH"], 0.0, 1.0)
+    return peak * ramp * ramp
+
+
 def apply_background_composition(
     patch_bgra: np.ndarray,
     bg_paths: list,
     kind: BackgroundKind = BackgroundKind.BLACK,
     seed: int | None = None,
+    scene_paths: list | None = None,
+    rim_fade: bool = False,
 ) -> np.ndarray:
-    """把 Base/Tier 小地图以相同规则叠到程序化游戏场景上。"""
+    """把 Base/Tier 小地图以相同规则叠到游戏场景背景上；rim_fade 时外圈地图层按实机渐隐，透出同一张背景。"""
     if patch_bgra.shape[2] != 4:
         return patch_bgra.copy()
 
     foreground = patch_bgra[..., :3].astype(np.float32)
     alpha = patch_bgra[..., 3].astype(np.float32)[..., None] / 255.0
+    if rim_fade and random.random() < CONFIG["RIM_FADE_PROB"]:
+        alpha = alpha * (1.0 - build_rim_fade(patch_bgra.shape[0])[..., None])
     if kind == BackgroundKind.BLACK:
         background = np.zeros_like(foreground)
     else:
@@ -1743,6 +1864,7 @@ def apply_background_composition(
             kind,
             seed,
             bg_paths,
+            scene_paths,
         )
 
     result = foreground * alpha + background * (1.0 - alpha)
@@ -1764,6 +1886,8 @@ def compose_patch(
     background_kind: BackgroundKind = BackgroundKind.BLACK,
     background_seed: int | None = None,
     tier_context: dict | None = None,
+    scene_paths: list | None = None,
+    rim_fade: bool = False,
 ) -> np.ndarray:
     """提取图块并合成背景。"""
     patch_bgra = extract_roi(img, cx, cy, angle, safe_size)
@@ -1785,6 +1909,8 @@ def compose_patch(
         bg_paths,
         background_kind,
         background_seed,
+        scene_paths,
+        rim_fade=rim_fade,
     )
 
 
@@ -2007,6 +2133,7 @@ def generate_samples(
     random_sampling_only: bool = False,
     tier_context: dict | None = None,
     background_run_seed: int = 0,
+    scene_paths: list | None = None,
 ) -> tuple[list, list]:
     """生成地图样本；Tier 按合法中心数确定总预算后分桶，其他类别保留追加增强。
 
@@ -2028,6 +2155,12 @@ def generate_samples(
         region_y = max(0, min(region_y, orig_h))
         region_w = max(0, min(region_w, orig_w - region_x))
         region_h = max(0, min(region_h, orig_h - region_y))
+    if random_sampling_only:
+        # 线上有效圆永远落在整屏之内：None 中心与位移都离边至少一个圆半径，圆内不出现补边透明区。
+        # 场景源图是小尺寸 HUD 外裁块（如 480×230），不收边时过半样本会混进程序化底。
+        margin = CONFIG["MASK_DIAMETER"] // 2
+        region_x, region_y = region_x + margin, region_y + margin
+        region_w, region_h = region_w - 2 * margin, region_h - 2 * margin
 
     region_x2 = region_x + region_w
     region_y2 = region_y + region_h
@@ -2233,13 +2366,15 @@ def generate_samples(
                 parent_patch,
                 tier_context["mask_mode"],
             )
+        base_clean = sample_region is not None and not can_augment[index]
         patch_bgr = apply_background_composition(
             patch,
             bg_paths,
             background_kind,
             background_seed,
+            scene_paths,
+            rim_fade=not (base_clean or random_sampling_only),
         )
-        base_clean = sample_region is not None and not can_augment[index]
         if base_clean:
             sample = apply_minimap_mask(patch_bgr)
         elif light_aug:
@@ -2284,6 +2419,8 @@ def generate_samples(
                 background_kind=background_kind,
                 background_seed=background_seed,
                 tier_context=tier_context,
+                scene_paths=scene_paths,
+                rim_fade=True,
             )
             sample = (
                 augment_patch_light(patch_bgr, UiClutter.TIER_CENTER)
@@ -2339,6 +2476,8 @@ def generate_samples(
             background_kind=background_kind,
             background_seed=background_seed,
             tier_context=tier_context,
+            scene_paths=scene_paths,
+            rim_fade=True,
         )
         sample = augment_zone_patch(patch_bgr, fill_color, ui_clutter)
         train_only_samples.append(finalize_positive_map_sample(sample))
@@ -2361,6 +2500,8 @@ def generate_samples(
             background_kind=background_kind,
             background_seed=background_seed,
             tier_context=tier_context,
+            scene_paths=scene_paths,
+            rim_fade=True,
         )
         sample = augment_zone_patch(patch_bgr, fill_color, ui_clutter)
         train_only = ui_clutter != UiClutter.NONE
@@ -2465,10 +2606,13 @@ def process_image_task(
     target_count_override: int | None = None,
     tier_spec: dict | None = None,
     background_run_seed: int = 0,
+    scene_paths: list | None = None,
+    tile: dict | None = None,
 ):
-    """单张源图处理入口，供 ProcessPoolExecutor 调度。"""
+    """单张源图处理入口，供 ProcessPoolExecutor 调度；Base 传 tile 时只处理这一格。"""
     safe_size = get_safe_size()
 
+    is_none = class_name == "None"
     img = load_image(file_path, safe_size)
     if img is None:
         return {
@@ -2493,9 +2637,10 @@ def process_image_task(
     orig_h, orig_w = h - 2 * pad, w - 2 * pad
 
     if class_name in CONFIG["BASE_CLASS_NAMES"]:
-        tiles = enumerate_base_tiles(orig_h, orig_w, class_name)
+        tiles = [tile] if tile is not None else enumerate_base_tiles(orig_h, orig_w, class_name)
         tile_mapping = {}
         processed_count = 0
+        generated_count = 0
 
         for tile in tiles:
             tile_class = tile["class_name"]
@@ -2506,6 +2651,7 @@ def process_image_task(
                 bg_paths,
                 sample_region=region,
                 background_run_seed=background_run_seed,
+                scene_paths=scene_paths,
             )
 
             tile_mapping[tile_class] = {
@@ -2530,13 +2676,17 @@ def process_image_task(
                 train_only_samples,
             )
             processed_count += 1
+            generated_count += len(samples) + len(train_only_samples)
 
+        if tile is not None:
+            message = f"Completed {tile['class_name']}: {generated_count} generated"
+        else:
+            message = f"Completed tiled base {class_name} -> {processed_count}/{len(tiles)} tile classes with samples"
         return {
-            "message": f"Completed tiled base {class_name} -> {processed_count}/{len(tiles)} tile classes with samples",
+            "message": message,
             "tile_mapping": tile_mapping,
         }
 
-    is_none = class_name == "None"
     # Tier 未指定数量时由 generate_samples 按合法中心数确定。
     target_count = (
         target_count_override
@@ -2552,6 +2702,7 @@ def process_image_task(
         random_sampling_only=is_none,
         tier_context=tier_context,
         background_run_seed=background_run_seed,
+        scene_paths=scene_paths,
     )
 
     generated_count = len(samples) + len(train_only_samples)
@@ -2574,9 +2725,76 @@ def process_image_task(
     }
 
 
+def _init_worker(config: dict) -> None:
+    """Windows/macOS 用 spawn 起子进程，子进程重新 import 本模块，命令行覆盖的 CONFIG 要显式带过去。"""
+    CONFIG.update(config)
+
+
+def expand_base_tile_tasks(
+    tasks: list[tuple[Path, str, int | None]],
+) -> list[tuple[Path, str, int | None, dict | None]]:
+    """Base 大图拆成每格一个任务，None 小任务排到最后。
+
+    Map02Base 一张图占全部样本一半以上，整张交给一个进程时其余进程早早跑完闲着，
+    后半程只剩一两个核。按格拆开后各任务都在一两千张，进程池按提交顺序取任务，
+    几十张的 None 垫在队尾补齐最后一段。每格仍是同样一次 generate_samples 调用，背景种子按格内序号算，
+    拆分不改变生成规则。
+    """
+    expanded = []
+    for file_path, class_name, target_count in tasks:
+        img = (
+            safe_imread(file_path, cv2.IMREAD_UNCHANGED)
+            if class_name in CONFIG["BASE_CLASS_NAMES"]
+            else None
+        )
+        if img is None:
+            # 读不出的 Base 原样交给 process_image_task，沿用它的加载失败报告。
+            expanded.append((file_path, class_name, target_count, None))
+            continue
+        orig_h, orig_w = img.shape[:2]
+        expanded.extend(
+            (file_path, class_name, target_count, tile)
+            for tile in enumerate_base_tiles(orig_h, orig_w, class_name)
+        )
+    expanded.sort(key=lambda task: task[1] == "None")
+    return expanded
+
+
 # ---------------------------------------------------------------------------
 # 主流水线
 # ---------------------------------------------------------------------------
+
+
+def allocate_none_counts(
+    files: list[Path],
+    total_cap: int,
+    min_per_file: int | None = None,
+) -> list[tuple[Path, int]]:
+    """把 None 总配额均分到各张截图，单图数量限制在 NONE_PER_IMAGE_MIN..MAX。"""
+    if min_per_file is None:
+        min_per_file = CONFIG["NONE_PER_IMAGE_MIN"]
+    max_per_file = CONFIG["NONE_PER_IMAGE_MAX"]
+    per_file = max(min_per_file, min(max_per_file, total_cap // len(files)))
+    remainder = total_cap % len(files)
+    counts = []
+    for idx, file_path in enumerate(sorted(files)):
+        extra = 1 if idx < remainder and per_file < max_per_file else 0
+        target_count = min(max_per_file, per_file + extra)
+        if target_count > 0:
+            counts.append((file_path, target_count))
+    return counts
+
+
+def allocate_scene_none_counts(scene_paths: list[Path], total_cap: int) -> list[tuple[Path, int]]:
+    """场景 None 先按组份额切总量，组内再均分；场景帧多而小，单图下限会把总量抬过配额，下限取 1。"""
+    groups = _scene_groups(tuple(scene_paths))
+    counts = []
+    remaining = total_cap
+    for index, (share, paths) in enumerate(groups):
+        group_cap = remaining if index == len(groups) - 1 else int(round(total_cap * share))
+        remaining -= group_cap
+        counts.extend(allocate_none_counts(list(paths), group_cap, min_per_file=1))
+    return counts
 
 
 class DataPreprocessor:
@@ -2591,6 +2809,7 @@ class DataPreprocessor:
         fixed_val_dir: str,
         max_workers: int | None = None,
         map_export_path: str = DEFAULT_OPTIONS["map_export"],
+        scene_dir: str = DEFAULT_OPTIONS["scene"],
     ):
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
@@ -2617,6 +2836,12 @@ class DataPreprocessor:
             f"Discovered {len(self.bg_paths)} shared background distractor sources."
         )
         logger.info(f"Background generation seed: {self.background_run_seed}")
+
+        # 真实大世界画面（720p 尺度、已切掉 HUD 的任意尺寸裁块或整屏截图），按子目录分组：
+        # 既生成场景 None 样本，也作为地图类透明区的透出底。
+        self.scene_paths = discover_scene_paths(Path(scene_dir) if scene_dir else None)
+        group_sizes = Counter(path.parent.name for path in self.scene_paths)
+        logger.info(f"Discovered {len(self.scene_paths)} open-world scene frames: {dict(sorted(group_sizes.items()))}")
 
     def run(self) -> None:
         """执行完整预处理流水线。"""
@@ -2650,18 +2875,19 @@ class DataPreprocessor:
 
         if none_files:
             none_cap = CONFIG["NONE_CLASS_TOTAL_CAP"]
-            min_per_file = CONFIG["NONE_PER_IMAGE_MIN"]
-            max_per_file = CONFIG["NONE_PER_IMAGE_MAX"]
-            per_file = max(min_per_file, min(max_per_file, none_cap // len(none_files)))
-            remainder = none_cap % len(none_files)
             logger.info(
                 f"Applying None class cap: {none_cap} total samples across {len(none_files)} files."
             )
-            for idx, file_path in enumerate(sorted(none_files)):
-                extra = 1 if idx < remainder and per_file < max_per_file else 0
-                target_count = min(max_per_file, per_file + extra)
-                if target_count > 0:
-                    tasks.append((file_path, "None", target_count))
+            for file_path, target_count in allocate_none_counts(none_files, none_cap):
+                tasks.append((file_path, "None", target_count))
+
+        if self.scene_paths:
+            scene_cap = CONFIG["NONE_SCENE_TOTAL_CAP"]
+            logger.info(
+                f"Applying None scene cap: {scene_cap} total samples across {len(self.scene_paths)} scene frames."
+            )
+            for file_path, target_count in allocate_scene_none_counts(self.scene_paths, scene_cap):
+                tasks.append((file_path, "None", target_count))
 
         tier_classes = {
             class_name
@@ -2684,16 +2910,21 @@ class DataPreprocessor:
                     details.append(f"stale entries: {', '.join(extra)}")
                 raise ValueError("map_export.json does not match source_images (" + "; ".join(details) + ")")
 
+        tile_tasks = expand_base_tile_tasks(tasks)
         max_workers = self.max_workers or os.cpu_count() or 4
         logger.info(
-            f"Starting parallel processing with {max_workers} workers for {len(tasks)} tasks..."
+            f"Starting parallel processing with {max_workers} workers for {len(tile_tasks)} tasks..."
         )
 
         merged_tile_mapping = {}
         failed_tasks = []
 
-        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-            future_to_file = {
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=_init_worker,
+            initargs=(dict(CONFIG),),
+        ) as executor:
+            future_to_label = {
                 executor.submit(
                     process_image_task,
                     file_path,
@@ -2703,20 +2934,24 @@ class DataPreprocessor:
                     target_count_override,
                     self.tier_specs.get(class_name) if self.tier_specs else None,
                     self.background_run_seed,
-                ): file_path
-                for file_path, class_name, target_count_override in tasks
+                    self.scene_paths,
+                    tile,
+                ): tile["class_name"] if tile else file_path
+                for file_path, class_name, target_count_override, tile in tile_tasks
             }
 
-            for future in concurrent.futures.as_completed(future_to_file):
-                file_path = future_to_file[future]
+            for done, future in enumerate(
+                concurrent.futures.as_completed(future_to_label), start=1
+            ):
+                label = future_to_label[future]
                 try:
                     result = future.result()
-                    logger.info(result["message"])
+                    logger.info(f"[{done}/{len(tile_tasks)}] {result['message']}")
                     if result["tile_mapping"]:
                         merged_tile_mapping.update(result["tile_mapping"])
                 except Exception as e:
-                    logger.error(f"Error processing {file_path}: {e}")
-                    failed_tasks.append((file_path, e))
+                    logger.error(f"Error processing {label}: {e}")
+                    failed_tasks.append((label, e))
 
         if failed_tasks:
             summary = "; ".join(f"{path}: {error}" for path, error in failed_tasks[:5])
@@ -2725,6 +2960,8 @@ class DataPreprocessor:
             raise RuntimeError(f"Preprocessing failed for {len(failed_tasks)} task(s): {summary}")
 
         if merged_tile_mapping:
+            # 各格按完成顺序回来，按格名排序让 tile_mapping.json 每次输出一致。
+            merged_tile_mapping = dict(sorted(merged_tile_mapping.items()))
             save_tile_mapping(merged_tile_mapping, self.output_dir)
             logger.info(f"Saved tile mapping with {len(merged_tile_mapping)} entries.")
 
@@ -2769,6 +3006,11 @@ def parse_args() -> argparse.Namespace:
         "--bg",
         default=argparse.SUPPRESS,
         help=f"Directory containing background images (default: {DEFAULT_OPTIONS['bg']})",
+    )
+    parser.add_argument(
+        "--scene",
+        default=argparse.SUPPRESS,
+        help=f"Directory containing open-world screenshots without the minimap (default: {DEFAULT_OPTIONS['scene']})",
     )
     parser.add_argument(
         "--fixed-val",
@@ -2824,6 +3066,13 @@ def parse_args() -> argparse.Namespace:
         help=f"单张 None 图最大采样数 (default: {CONFIG['NONE_PER_IMAGE_MAX']})",
     )
     parser.add_argument(
+        "--none-scene-total-cap",
+        dest="none_scene_total_cap",
+        type=int,
+        default=argparse.SUPPRESS,
+        help=f"大世界场景 None 样本总数 (default: {CONFIG['NONE_SCENE_TOTAL_CAP']})",
+    )
+    parser.add_argument(
         "--val-ratio",
         dest="val_ratio",
         type=float,
@@ -2869,4 +3118,5 @@ if __name__ == "__main__":
         args.fixed_val,
         args.workers,
         args.map_export,
+        args.scene,
     ).run()
