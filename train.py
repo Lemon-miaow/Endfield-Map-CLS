@@ -14,10 +14,12 @@ train.py — YOLO 分类器训练脚本
                     [--epochs <int>] [--imgsz <int>] [--batch <int>]
                     [--nbs <int>] [--workers <int>] [--patience <int>]
                     [--device <id>] [--name <str>] [--compile <mode|False>]
-                    [--shutdown]
+                    [--shutdown] [--resume <last.pt>]
 
 --shutdown：训练结束（早停、跑满轮数或异常退出）后执行系统关机，用于云 GPU 无人值守时省钱；
 权重与 results.csv 在每轮结束时已落盘，关机前不再有待写数据。
+--resume：从中断训练的 last.pt 接着跑。轮数、优化器、EMA、学习率进度、数据集路径与输出目录取自检查点，
+batch、workers、device、patience 按本次参数（Ultralytics 允许续训时调这几项省内存）；中途不要重跑 preprocess。
 """
 
 from __future__ import annotations
@@ -327,9 +329,12 @@ def train(args: argparse.Namespace) -> None:
     Args:
         args: 由 argparse 解析的命令行参数对象。
     """
-    model_path = args.model
+    resume = getattr(args, "resume", None)
+    model_path = resume or args.model
 
-    if model_path == "auto":
+    if resume:
+        logger.info(f"Resuming interrupted training from checkpoint: {resume}")
+    elif model_path == "auto":
         latest_pt = find_latest_model(args.project)
         if latest_pt:
             logger.info(
@@ -368,6 +373,7 @@ def train(args: argparse.Namespace) -> None:
             save=True,
             project=args.project,
             name=args.name,
+            resume=bool(resume),
         )
     finally:
         if getattr(args, "shutdown", False):
@@ -474,6 +480,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=argparse.SUPPRESS,
         help="Power off the machine after training ends (early stop, max epochs or crash)",
+    )
+
+    parser.add_argument(
+        "--resume",
+        default=argparse.SUPPRESS,
+        help="Continue an interrupted run from its last.pt (epoch, optimizer and save dir come from the checkpoint)",
     )
 
     config = DEFAULT_CONFIG.copy()

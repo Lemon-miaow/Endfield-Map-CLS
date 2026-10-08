@@ -131,6 +131,19 @@ class TrainingGeometryTests(unittest.TestCase):
                 train(args)
         shutdown.assert_called_once()
 
+    def test_resume_continues_from_checkpoint(self) -> None:
+        with patch("sys.argv", ["train.py"]):
+            self.assertIsNone(getattr(parse_args(), "resume", None))
+
+        args = SimpleNamespace(model="auto", data="d", epochs=1, imgsz=128, batch=1, nbs=1, workers=0,
+                               device="cpu", patience=1, erasing=0.0, auto_augment=None, compile=False,
+                               project="p", name="n", resume="runs/train-2/weights/last.pt")
+        with patch("train.YOLO") as yolo, patch("train.find_latest_model") as latest:
+            train(args)
+        latest.assert_not_called()
+        yolo.assert_called_once_with("runs/train-2/weights/last.pt")
+        self.assertIs(yolo.return_value.train.call_args.kwargs["resume"], True)
+
     def test_color_augmentation_still_varies(self) -> None:
         self.trainer.args.hsv_h = 0.015
         self.trainer.args.hsv_s = 0.7
